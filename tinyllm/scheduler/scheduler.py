@@ -34,12 +34,16 @@ class Scheduler:
     def step(self) -> None:
         """Admit waiting sequences, prefill newcomers, and decode active sequences."""
         with self._lock:
+            cancelled = [r for r in self._running if r.status == "cancelled"]
+            for req in cancelled:
+                self._release_request_state(req)
+                req.ready.set()
             while self._waiting and len(self._running) < self.max_num_seqs:
                 req = self._waiting.popleft()
                 req.status = "running"
                 self._running.append(req)
-            fresh = [r for r in self._running if r.state is None]
-            active = [r for r in self._running if r.state is not None]
+            fresh = [r for r in self._running if r.status == "running" and r.state is None]
+            active = [r for r in self._running if r.status == "running" and r.state is not None]
 
         try:
             # New requests can join the batch while older requests are decoding.
@@ -48,10 +52,15 @@ class Scheduler:
                 if len(outputs) != len(fresh):
                     raise RuntimeError("backend prefill returned the wrong batch size")
                 for req, (token, state) in zip(fresh, outputs):
-                    req.output_tokens.append(token)
-                    req.state = state
-                    if self._done(req):
-                        self._finish(req)
+                    with self._lock:
+                        req.state = state
+                        if req.status == "cancelled":
+                            self._release_request_state(req)
+                            req.ready.set()
+                        else:
+                            req.output_tokens.append(token)
+                            if self._done(req):
+                                self._finish(req)
             if active:
                 outputs = self.backend.decode_step(
                     [r.output_tokens[-1] for r in active], [r.state for r in active]
@@ -59,21 +68,27 @@ class Scheduler:
                 if len(outputs) != len(active):
                     raise RuntimeError("backend decode returned the wrong batch size")
                 for req, (token, state, backend_done) in zip(active, outputs):
-                    req.state = state
-                    if token:
-                        req.output_tokens.append(token)
-                    if backend_done or self._done(req):
-                        self._finish(req)
+                    with self._lock:
+                        req.state = state
+                        if req.status == "cancelled":
+                            self._release_request_state(req)
+                            req.ready.set()
+                        else:
+                            req.output_tokens.append(token)
+                            if backend_done or self._done(req):
+                                self._finish(req)
         except Exception as exc:
             with self._lock:
                 for req in fresh + active:
-                    if req.status == "running":
+                    if req.status in ("running", "cancelled"):
                         try:
                             self._release_request_state(req)
-                            req.error = str(exc)
+                            if req.status == "running":
+                                req.error = str(exc)
                         except Exception as cleanup_exc:
                             req.error = f"{exc}; KV cache cleanup failed: {cleanup_exc}"
-                        req.status = "failed"
+                        if req.status == "running":
+                            req.status = "failed"
                         req.ready.set()
 
         with self._lock:
@@ -97,6 +112,22 @@ class Scheduler:
         if release_state is not None:
             release_state(req.state)
         req.state = None
+
+    def cancel(self, req: Request) -> None:
+        """Cancel a request; running model work is cleaned up by the next step."""
+        with self._lock:
+            if req.status in ("finished", "failed", "cancelled"):
+                return
+            if req.status == "waiting":
+                try:
+                    self._waiting.remove(req)
+                except ValueError:
+                    pass
+                req.status = "cancelled"
+                req.ready.set()
+                return
+            req.status = "cancelled"
+            req.ready.set()
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

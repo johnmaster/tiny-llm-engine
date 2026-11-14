@@ -44,6 +44,7 @@ class LLMEngine:
         req = self.submit(prompt, max_tokens)
         self.start()
         if not req.ready.wait(timeout):
+            self.scheduler.cancel(req)
             raise TimeoutError(f"request {req.request_id} timed out")
         if req.status == "failed":
             raise RuntimeError(req.error)

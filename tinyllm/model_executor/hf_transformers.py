@@ -1,13 +1,15 @@
 """A small Hugging Face causal-LM backend with batched prefill and decode.
 
 This is a correctness-first backend for learning and experimentation. It uses
-greedy sampling and padded KV batches; it is not yet optimized like vLLM.
+greedy sampling, FA4 for prefill when selected, and a paged PyTorch reference
+path for Qwen3 decode. It is not optimized like vLLM.
 Install the dependencies listed in ``requirements-gpu.txt`` in a CUDA-enabled
 PyTorch environment before running it on a GPU machine.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any, Sequence
 
 from ..kv_cache import BlockTable, PagedKVTensorStore
@@ -77,6 +79,7 @@ class HuggingFaceBackend:
         self.attention_backend = attention_backend
         self._attention_calls: dict[str, int] = {}
         self._attention_layers: list[tuple[str, str]] = []
+        self._attention_modules: list[tuple[str, Any]] = []
         for name, module in self.model.named_modules():
             if not name.endswith(".self_attn") or not hasattr(module, "config"):
                 continue
@@ -84,6 +87,7 @@ class HuggingFaceBackend:
             if configured_backend is None:
                 continue
             self._attention_layers.append((name, configured_backend))
+            self._attention_modules.append((name, module))
             self._attention_calls[name] = 0
 
             def count_attention_call(_module: Any, _inputs: Any, _output: Any,
@@ -126,6 +130,19 @@ class HuggingFaceBackend:
             dtype=self.model.dtype,
             device=self.device,
         )
+        self._paged_context: dict[str, Any] | None = None
+        self._paged_decode_enabled = (
+            bool(self._attention_modules)
+            and all(module.__class__.__name__ == "Qwen3Attention"
+                    for _, module in self._attention_modules)
+        )
+        if self._paged_decode_enabled:
+            self._paged_attention_calls = [0] * len(self._attention_modules)
+            self._install_qwen3_paged_attention()
+        else:
+            self._paged_attention_calls = []
+        if getattr(config, "model_type", None) == "qwen3" and not self._paged_decode_enabled:
+            raise RuntimeError("This Transformers Qwen3 implementation cannot be patched for paged decode")
 
     def attention_summary(self) -> str | None:
         """Summarize configured backends and layers actually called so far."""
@@ -133,8 +150,13 @@ class HuggingFaceBackend:
             return None
         total = len(self._attention_layers)
         invoked = sum(self._attention_calls[name] > 0 for name, _ in self._attention_layers)
+        if self._paged_decode_enabled:
+            paged_layers = sum(count > 0 for count in self._paged_attention_calls)
+            decode_mode = f"paged reference {paged_layers}/{len(self._paged_attention_calls)} layers"
+        else:
+            decode_mode = "HF dense cache"
         return (f"Attention layers executed: {invoked}/{total}; "
-                f"configured backend: {self.attention_backend}")
+                f"prefill backend: {self.attention_backend}; decode: {decode_mode}")
 
     def kv_cache_summary(self) -> str:
         stats = self.kv_cache.manager.snapshot()
@@ -145,6 +167,56 @@ class HuggingFaceBackend:
     def release_state(self, state: object) -> None:
         if isinstance(state, _SequenceState):
             self.kv_cache.release(state.block_table)
+
+    def _install_qwen3_paged_attention(self) -> None:
+        for _, module in self._attention_modules:
+            original_forward = module.forward
+
+            def paged_forward(attention_module: Any, *args: Any,
+                              _original: Any = original_forward, **kwargs: Any) -> Any:
+                context = self._paged_context
+                if context is None:
+                    return _original(*args, **kwargs)
+                return self._qwen3_paged_attention_forward(attention_module, context,
+                                                           *args, **kwargs)
+
+            module.forward = MethodType(paged_forward, module)
+
+    def _qwen3_paged_attention_forward(self, module: Any, context: dict[str, Any],
+                                       hidden_states: Any, **kwargs: Any) -> tuple[Any, None]:
+        """Qwen3 single-token attention over the request's physical KV pages."""
+        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+
+        torch = self.torch
+        batch_size, query_length, _ = hidden_states.shape
+        if query_length != 1:
+            raise RuntimeError("paged decode currently supports one query token per sequence")
+        position_embeddings = kwargs.get("position_embeddings")
+        if position_embeddings is None:
+            raise RuntimeError("Qwen3 did not provide rotary position embeddings")
+        hidden_shape = (batch_size, query_length, -1, module.head_dim)
+        query = module.q_norm(module.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_shape = (batch_size, query_length, -1, module.head_dim)
+        key = module.k_norm(module.k_proj(hidden_states).view(key_shape)).transpose(1, 2)
+        value = module.v_proj(hidden_states).view(key_shape).transpose(1, 2)
+        query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
+
+        layer_idx = int(module.layer_idx)
+        for row, (table, old_length) in enumerate(zip(context["tables"], context["old_lengths"])):
+            self.kv_cache.write_layer(
+                table, layer_idx, old_length,
+                key[row, :, 0, :].unsqueeze(0), value[row, :, 0, :].unsqueeze(0),
+            )
+        outputs = [
+            self.kv_cache.paged_attention(
+                table, layer_idx, query[row, :, 0, :], float(module.scaling)
+            )
+            for row, table in enumerate(context["tables"])
+        ]
+        self._paged_attention_calls[layer_idx] += 1
+        attention_output = torch.stack(outputs, dim=0).unsqueeze(1).contiguous()
+        attention_output = attention_output.reshape(batch_size, query_length, -1).contiguous()
+        return module.o_proj(attention_output), None
 
     def encode(self, prompt: str) -> list[int]:
         return self.tokenizer.encode(prompt, add_special_tokens=True)
@@ -232,6 +304,8 @@ class HuggingFaceBackend:
         torch = self.torch
         seq_states = [state for state in states]
         lengths = [state.token_count for state in seq_states]
+        if self._paged_decode_enabled:
+            return self._decode_step_paged(tokens, seq_states, lengths)
         width = max(lengths)
         batched_layers = []
         for layer_index in range(self.kv_cache.num_layers):
@@ -273,3 +347,34 @@ class HuggingFaceBackend:
             results.append((token, state,
                             self.eos_token_id is not None and token == self.eos_token_id))
         return results
+
+    def _decode_step_paged(self, tokens: Sequence[int], states: Sequence[_SequenceState],
+                           old_lengths: list[int]) -> list[tuple[int, object, bool]]:
+        """Run Qwen3 decode with direct block-table attention, without dense KV gather."""
+        torch = self.torch
+        for state in states:
+            self.kv_cache.append(state.block_table, 1)
+
+        ids = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(1)
+        positions = torch.tensor(old_lengths, dtype=torch.long, device=self.device).unsqueeze(1)
+        self._paged_context = {
+            "tables": [state.block_table for state in states],
+            "old_lengths": old_lengths,
+        }
+        try:
+            with torch.inference_mode():
+                output = self.model(
+                    input_ids=ids,
+                    attention_mask=None,
+                    position_ids=positions,
+                    use_cache=False,
+                    return_dict=True,
+                )
+        finally:
+            self._paged_context = None
+
+        next_tokens = output.logits[:, -1, :].argmax(dim=-1).tolist()
+        return [
+            (int(token), state, self.eos_token_id is not None and int(token) == self.eos_token_id)
+            for token, state in zip(next_tokens, states)
+        ]

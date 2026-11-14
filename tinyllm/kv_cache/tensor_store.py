@@ -10,9 +10,9 @@ from .interfaces import BlockId, BlockTable
 class PagedKVTensorStore:
     """Store each layer's keys and values in fixed-size physical blocks.
 
-    Storage is allocated lazily per block. ``gather_layer`` currently rebuilds
-    dense tensors for Hugging Face attention; a paged attention kernel can later
-    consume ``BlockTable.block_ids`` directly and remove that gather.
+    Storage is allocated lazily per block. The Qwen3 decode reference path reads
+    blocks directly with online softmax. ``gather_layer`` remains for model
+    backends that still require a conventional dense cache.
     """
 
     def __init__(self, *, torch: Any, num_blocks: int, block_size: int,
@@ -93,6 +93,54 @@ class PagedKVTensorStore:
         key = self.torch.cat(key_parts, dim=0).permute(1, 0, 2).unsqueeze(0).contiguous()
         value = self.torch.cat(value_parts, dim=0).permute(1, 0, 2).unsqueeze(0).contiguous()
         return key, value
+
+    def paged_attention(self, table: BlockTable, layer_idx: int, query: Any,
+                        scale: float) -> Any:
+        """Reference single-token attention that reads KV blocks without gathering.
+
+        ``query`` is [query_heads, head_dim]. This uses online softmax across
+        pages, so the complete key/value sequence is never materialized as a
+        dense tensor. It is intentionally an unfused correctness implementation.
+        """
+        self._validate_layer(layer_idx)
+        if query.ndim != 2 or query.shape[-1] != self.head_dim:
+            raise ValueError("query must have shape [query_heads, head_dim]")
+        if table.token_count == 0:
+            raise ValueError("paged attention requires at least one cached token")
+        query_heads = query.shape[0]
+        if query_heads % self.num_kv_heads:
+            raise ValueError("query head count must be divisible by KV head count")
+        groups = query_heads // self.num_kv_heads
+        q = query.float()
+        running_max = self.torch.full((query_heads,), -float("inf"),
+                                      dtype=self.torch.float32, device=query.device)
+        running_sum = self.torch.zeros((query_heads,), dtype=self.torch.float32, device=query.device)
+        running_out = self.torch.zeros((query_heads, self.head_dim), dtype=self.torch.float32,
+                                       device=query.device)
+
+        remaining = table.token_count
+        for block_id in table.block_ids:
+            count = min(remaining, self.block_size)
+            if count <= 0:
+                break
+            block = self._storage[block_id]
+            if block is None:
+                raise RuntimeError(f"KV block {block_id} layer {layer_idx} has not been written")
+            keys = block[layer_idx, 0, :count].repeat_interleave(groups, dim=1).float()
+            values = block[layer_idx, 1, :count].repeat_interleave(groups, dim=1).float()
+            scores = self.torch.einsum("hd,thd->ht", q, keys) * scale
+            page_max = scores.max(dim=-1).values
+            new_max = self.torch.maximum(running_max, page_max)
+            old_scale = self.torch.exp(running_max - new_max)
+            weights = self.torch.exp(scores - new_max[:, None])
+            running_out = (running_out * old_scale[:, None]
+                           + self.torch.einsum("ht,thd->hd", weights, values))
+            running_sum = running_sum * old_scale + weights.sum(dim=-1)
+            running_max = new_max
+            remaining -= count
+        if remaining:
+            raise RuntimeError("block table is shorter than its valid token count")
+        return (running_out / running_sum[:, None]).to(dtype=query.dtype)
 
     def _ensure_block(self, block_id: BlockId) -> Any:
         block = self._storage[block_id]
