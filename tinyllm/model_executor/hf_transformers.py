@@ -10,17 +10,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from ..kv_cache import BlockTable, PagedKVTensorStore
+
 
 @dataclass
 class _SequenceState:
-    # Legacy HF cache: ((key, value), ...), each tensor shaped [1, heads, seq, dim].
-    past_key_values: tuple[tuple[Any, Any], ...]
-    token_count: int
+    block_table: BlockTable
+
+    @property
+    def token_count(self) -> int:
+        return self.block_table.token_count
 
 
 class HuggingFaceBackend:
     def __init__(self, model_name_or_path: str, *, dtype: str = "auto", device: str = "cuda",
-                 attention_backend: str = "sdpa"):
+                 attention_backend: str = "sdpa", max_num_seqs: int = 8,
+                 max_model_len: int = 8192, kv_block_size: int = 16):
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -96,6 +101,32 @@ class HuggingFaceBackend:
                     f"Some attention layers did not select {attention_backend}: {details}"
                 )
 
+        if max_num_seqs < 1 or max_model_len < 1 or kv_block_size < 1:
+            raise ValueError("max_num_seqs, max_model_len, and kv_block_size must be positive")
+        config = getattr(self.model.config, "text_config", None) or self.model.config
+        num_layers = len(self._attention_layers) or int(config.num_hidden_layers)
+        num_kv_heads = int(getattr(config, "num_key_value_heads", config.num_attention_heads))
+        head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
+        max_blocks = max_num_seqs * ((max_model_len + kv_block_size - 1) // kv_block_size)
+        if self.device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            bytes_per_block = (num_layers * 2 * num_kv_heads * head_dim * kv_block_size
+                               * torch.empty((), dtype=self.model.dtype).element_size())
+            # Leave room for temporary dense batches, logits, and CUDA workspaces.
+            memory_limited_blocks = max(1, int(free_bytes * 0.70) // bytes_per_block)
+            max_blocks = min(max_blocks, memory_limited_blocks)
+        self.kv_block_size = kv_block_size
+        self.kv_cache = PagedKVTensorStore(
+            torch=torch,
+            num_blocks=max_blocks,
+            block_size=kv_block_size,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=self.model.dtype,
+            device=self.device,
+        )
+
     def attention_summary(self) -> str | None:
         """Summarize configured backends and layers actually called so far."""
         if not self._attention_layers:
@@ -104,6 +135,16 @@ class HuggingFaceBackend:
         invoked = sum(self._attention_calls[name] > 0 for name, _ in self._attention_layers)
         return (f"Attention layers executed: {invoked}/{total}; "
                 f"configured backend: {self.attention_backend}")
+
+    def kv_cache_summary(self) -> str:
+        stats = self.kv_cache.manager.snapshot()
+        return (f"Paged KV storage: block_size={self.kv_block_size}; "
+                f"materialized_blocks={self.kv_cache.materialized_blocks}/"
+                f"{stats['total_blocks']}")
+
+    def release_state(self, state: object) -> None:
+        if isinstance(state, _SequenceState):
+            self.kv_cache.release(state.block_table)
 
     def encode(self, prompt: str) -> list[int]:
         return self.tokenizer.encode(prompt, add_special_tokens=True)
@@ -169,11 +210,20 @@ class HuggingFaceBackend:
         next_tokens = logits.argmax(dim=-1).tolist()
         full_cache = self._legacy_cache(output.past_key_values)
         results = []
-        for row, length in enumerate(lengths):
-            seq_cache = tuple((key[row:row + 1, ..., :length, :].contiguous(),
-                               value[row:row + 1, ..., :length, :].contiguous())
-                              for key, value in full_cache)
-            results.append((int(next_tokens[row]), _SequenceState(seq_cache, length)))
+        allocated: list[BlockTable] = []
+        try:
+            for row, length in enumerate(lengths):
+                table = self.kv_cache.allocate(length)
+                allocated.append(table)
+                for layer_idx, (key, value) in enumerate(full_cache):
+                    key_tokens = key[row, :, :length, :].permute(1, 0, 2).contiguous()
+                    value_tokens = value[row, :, :length, :].permute(1, 0, 2).contiguous()
+                    self.kv_cache.write_layer(table, layer_idx, 0, key_tokens, value_tokens)
+                results.append((int(next_tokens[row]), _SequenceState(table)))
+        except Exception:
+            for table in allocated:
+                self.kv_cache.release(table)
+            raise
         return results
 
     def decode_step(self, tokens: Sequence[int], states: Sequence[object]) -> list[tuple[int, object, bool]]:
@@ -184,10 +234,10 @@ class HuggingFaceBackend:
         lengths = [state.token_count for state in seq_states]
         width = max(lengths)
         batched_layers = []
-        for layer_index in range(len(seq_states[0].past_key_values)):
+        for layer_index in range(self.kv_cache.num_layers):
             keys, values = [], []
             for state in seq_states:
-                key, value = state.past_key_values[layer_index]
+                key, value = self.kv_cache.gather_layer(state.block_table, layer_index)
                 missing = width - state.token_count
                 if missing:
                     key = torch.nn.functional.pad(key, (0, 0, 0, missing))
@@ -212,14 +262,14 @@ class HuggingFaceBackend:
         cache = self._legacy_cache(output.past_key_values)
         results = []
         for row, (token, state) in enumerate(zip(next_tokens, seq_states)):
-            new_length = state.token_count + 1
-            # The current token is appended after the batch's padded KV width;
-            # for a shorter sequence, slicing :new_length would select padding
-            # and lose this token's KV entry.
-            seq_cache = tuple((torch.cat((old_key, key[row:row + 1, ..., width:width + 1, :]), dim=-2).contiguous(),
-                               torch.cat((old_value, value[row:row + 1, ..., width:width + 1, :]), dim=-2).contiguous())
-                              for (old_key, old_value), (key, value) in zip(state.past_key_values, cache))
+            old_length = state.token_count
+            self.kv_cache.append(state.block_table, 1)
+            for layer_idx, (key, value) in enumerate(cache):
+                key_token = key[row, :, width:width + 1, :].permute(1, 0, 2).contiguous()
+                value_token = value[row, :, width:width + 1, :].permute(1, 0, 2).contiguous()
+                self.kv_cache.write_layer(state.block_table, layer_idx, old_length,
+                                          key_token, value_token)
             token = int(token)
-            results.append((token, _SequenceState(seq_cache, new_length),
+            results.append((token, state,
                             self.eos_token_id is not None and token == self.eos_token_id))
         return results

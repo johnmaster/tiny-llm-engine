@@ -68,7 +68,11 @@ class Scheduler:
             with self._lock:
                 for req in fresh + active:
                     if req.status == "running":
-                        req.error = str(exc)
+                        try:
+                            self._release_request_state(req)
+                            req.error = str(exc)
+                        except Exception as cleanup_exc:
+                            req.error = f"{exc}; KV cache cleanup failed: {cleanup_exc}"
                         req.status = "failed"
                         req.ready.set()
 
@@ -81,10 +85,18 @@ class Scheduler:
             eos is not None and bool(req.output_tokens) and req.output_tokens[-1] == eos
         )
 
-    @staticmethod
-    def _finish(req: Request) -> None:
+    def _finish(self, req: Request) -> None:
+        self._release_request_state(req)
         req.status = "finished"
         req.ready.set()
+
+    def _release_request_state(self, req: Request) -> None:
+        if req.state is None:
+            return
+        release_state = getattr(self.backend, "release_state", None)
+        if release_state is not None:
+            release_state(req.state)
+        req.state = None
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

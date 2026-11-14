@@ -27,7 +27,9 @@ def main() -> None:
     if args.model:
         from .model_executor.hf_transformers import HuggingFaceBackend
         backend = HuggingFaceBackend(args.model, dtype=args.dtype, device=args.device,
-                                     attention_backend=args.attention_backend)
+                                     attention_backend=args.attention_backend,
+                                     max_num_seqs=args.max_num_seqs,
+                                     max_model_len=args.max_model_len)
         print(f"Attention backend: {backend.attention_backend}")
     else:
         backend = MockBackend()
@@ -41,6 +43,9 @@ def main() -> None:
             summary = attention_summary()
             if summary:
                 print(summary)
+        kv_cache_summary = getattr(backend, "kv_cache_summary", None)
+        if kv_cache_summary is not None:
+            print(kv_cache_summary())
         print(engine.backend.decode(req.output_tokens))
     finally:
         engine.shutdown()
