@@ -16,11 +16,19 @@ def main() -> None:
     parser.add_argument("--model", help="Hugging Face model name or local model path; enables CUDA inference")
     parser.add_argument("--device", default="cuda", help="device for --model (default: cuda)")
     parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto")
+    parser.add_argument(
+        "--attention-backend",
+        choices=("sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4"),
+        default="sdpa",
+        help="Hugging Face attention implementation (RTX 5090: try flash_attention_4)",
+    )
     args = parser.parse_args()
 
     if args.model:
         from .model_executor.hf_transformers import HuggingFaceBackend
-        backend = HuggingFaceBackend(args.model, dtype=args.dtype, device=args.device)
+        backend = HuggingFaceBackend(args.model, dtype=args.dtype, device=args.device,
+                                     attention_backend=args.attention_backend)
+        print(f"Attention backend: {backend.attention_backend}")
     else:
         backend = MockBackend()
         print("Using MockBackend; pass --model <path> on the GPU server for real inference.")
@@ -28,6 +36,11 @@ def main() -> None:
                                                   max_model_len=args.max_model_len))
     try:
         req = engine.generate(args.prompt, args.max_tokens)
+        attention_summary = getattr(backend, "attention_summary", None)
+        if attention_summary is not None:
+            summary = attention_summary()
+            if summary:
+                print(summary)
         print(engine.backend.decode(req.output_tokens))
     finally:
         engine.shutdown()

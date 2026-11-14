@@ -19,7 +19,8 @@ class _SequenceState:
 
 
 class HuggingFaceBackend:
-    def __init__(self, model_name_or_path: str, *, dtype: str = "auto", device: str = "cuda"):
+    def __init__(self, model_name_or_path: str, *, dtype: str = "auto", device: str = "cuda",
+                 attention_backend: str = "sdpa"):
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -38,13 +39,71 @@ class HuggingFaceBackend:
         dtype_map = {"auto": "auto", "float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
         if dtype not in dtype_map:
             raise ValueError("dtype must be auto, float16, bfloat16, or float32")
+        supported_attention = {"sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4"}
+        if attention_backend not in supported_attention:
+            choices = ", ".join(sorted(supported_attention))
+            raise ValueError(f"attention_backend must be one of: {choices}")
+        if attention_backend.startswith("flash_attention") and not device.startswith("cuda"):
+            raise ValueError(f"{attention_backend} requires a CUDA device")
         self.device = torch.device(device)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            dtype=dtype_map[dtype],
-            low_cpu_mem_usage=True,
-        ).to(self.device)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                dtype=dtype_map[dtype],
+                attn_implementation=attention_backend,
+                low_cpu_mem_usage=True,
+            ).to(self.device)
+        except (ImportError, RuntimeError, ValueError) as exc:
+            if attention_backend == "sdpa":
+                raise
+            raise RuntimeError(
+                f"Could not initialize attention backend '{attention_backend}'. "
+                "Check that the installed Transformers release supports it and that its "
+                "FlashAttention kernel is installed and compatible with this PyTorch/CUDA/GPU. "
+                "For RTX 5090, use flash_attention_4 with a Transformers release that supports "
+                "it and flash-attn-4 built for CUDA 13."
+            ) from exc
         self.model.eval()
+        if attention_backend.startswith("flash_attention") and self.model.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                f"{attention_backend} requires float16 or bfloat16 model weights; "
+                f"loaded dtype is {self.model.dtype}. Set --dtype bfloat16 or --dtype float16."
+            )
+        self.attention_backend = attention_backend
+        self._attention_calls: dict[str, int] = {}
+        self._attention_layers: list[tuple[str, str]] = []
+        for name, module in self.model.named_modules():
+            if not name.endswith(".self_attn") or not hasattr(module, "config"):
+                continue
+            configured_backend = getattr(module.config, "_attn_implementation", None)
+            if configured_backend is None:
+                continue
+            self._attention_layers.append((name, configured_backend))
+            self._attention_calls[name] = 0
+
+            def count_attention_call(_module: Any, _inputs: Any, _output: Any,
+                                     layer_name: str = name) -> None:
+                self._attention_calls[layer_name] += 1
+
+            module.register_forward_hook(count_attention_call)
+
+        if self._attention_layers:
+            mismatched = [(name, backend) for name, backend in self._attention_layers
+                          if backend != attention_backend]
+            if mismatched:
+                details = ", ".join(f"{name}={backend}" for name, backend in mismatched)
+                raise RuntimeError(
+                    f"Some attention layers did not select {attention_backend}: {details}"
+                )
+
+    def attention_summary(self) -> str | None:
+        """Summarize configured backends and layers actually called so far."""
+        if not self._attention_layers:
+            return None
+        total = len(self._attention_layers)
+        invoked = sum(self._attention_calls[name] > 0 for name, _ in self._attention_layers)
+        return (f"Attention layers executed: {invoked}/{total}; "
+                f"configured backend: {self.attention_backend}")
 
     def encode(self, prompt: str) -> list[int]:
         return self.tokenizer.encode(prompt, add_special_tokens=True)

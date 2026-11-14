@@ -81,3 +81,36 @@ torch.cuda.synchronize()
 
 print("CUDA test: SUCCESS")
 PY
+
+
+# install flash-attention-4
+conda activate tinyllm
+
+python -m pip install --upgrade "transformers[kernels]>=5.22.1" \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+python -m pip install --pre "flash-attn-4[cu13]" \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# verificate flash-attention-4
+python - <<'PY'
+import torch
+import transformers
+from flash_attn.cute import flash_attn_func
+
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("GPU:", torch.cuda.get_device_name(0))
+print("Transformers:", transformers.__version__)
+print("FlashAttention 4 import: OK")
+PY
+
+# run model to verificate FA4 inference
+python -m tinyllm \
+  --model /root/models/Qwen3-8B \
+  --dtype bfloat16 \
+  --attention-backend flash_attention_4 \
+  --max-num-seqs 1 \
+  --max-model-len 4096 \
+  --prompt "你好" \
+  --max-tokens 64
