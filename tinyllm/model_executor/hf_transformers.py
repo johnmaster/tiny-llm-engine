@@ -1,8 +1,9 @@
 """A small Hugging Face causal-LM backend with batched prefill and decode.
 
 This is a correctness-first backend for learning and experimentation. It uses
-greedy sampling, FA4 for prefill when selected, and a paged PyTorch reference
-path for Qwen3 decode. It is not optimized like vLLM.
+greedy sampling, the selected Hugging Face attention backend for prefill, and a
+Triton kernel that reads Qwen3 decode KV directly through the page table. It is
+not optimized like vLLM.
 Install the dependencies listed in ``requirements-gpu.txt`` in a CUDA-enabled
 PyTorch environment before running it on a GPU machine.
 """
@@ -117,7 +118,9 @@ class HuggingFaceBackend:
             bytes_per_block = (num_layers * 2 * num_kv_heads * head_dim * kv_block_size
                                * torch.empty((), dtype=self.model.dtype).element_size())
             # Leave room for temporary dense batches, logits, and CUDA workspaces.
-            memory_limited_blocks = max(1, int(free_bytes * 0.70) // bytes_per_block)
+            # The paged kernel uses fixed contiguous per-layer pools, so retain
+            # extra headroom for prefill workspaces and logits.
+            memory_limited_blocks = max(1, int(free_bytes * 0.45) // bytes_per_block)
             max_blocks = min(max_blocks, memory_limited_blocks)
         self.kv_block_size = kv_block_size
         self.kv_cache = PagedKVTensorStore(
@@ -152,7 +155,7 @@ class HuggingFaceBackend:
         invoked = sum(self._attention_calls[name] > 0 for name, _ in self._attention_layers)
         if self._paged_decode_enabled:
             paged_layers = sum(count > 0 for count in self._paged_attention_calls)
-            decode_mode = f"paged reference {paged_layers}/{len(self._paged_attention_calls)} layers"
+            decode_mode = f"Triton paged decode {paged_layers}/{len(self._paged_attention_calls)} layers"
         else:
             decode_mode = "HF dense cache"
         return (f"Attention layers executed: {invoked}/{total}; "
@@ -161,7 +164,7 @@ class HuggingFaceBackend:
     def kv_cache_summary(self) -> str:
         stats = self.kv_cache.manager.snapshot()
         return (f"Paged KV storage: block_size={self.kv_block_size}; "
-                f"materialized_blocks={self.kv_cache.materialized_blocks}/"
+                f"active_blocks={self.kv_cache.materialized_blocks}/"
                 f"{stats['total_blocks']}")
 
     def release_state(self, state: object) -> None:
@@ -207,14 +210,12 @@ class HuggingFaceBackend:
                 table, layer_idx, old_length,
                 key[row, :, 0, :].unsqueeze(0), value[row, :, 0, :].unsqueeze(0),
             )
-        outputs = [
-            self.kv_cache.paged_attention(
-                table, layer_idx, query[row, :, 0, :], float(module.scaling)
-            )
-            for row, table in enumerate(context["tables"])
-        ]
+        attention_output = self.kv_cache.paged_attention(
+            layer_idx, query[:, :, 0, :], context["page_table"],
+            context["lengths"], float(module.scaling),
+        )
         self._paged_attention_calls[layer_idx] += 1
-        attention_output = torch.stack(outputs, dim=0).unsqueeze(1).contiguous()
+        attention_output = attention_output.unsqueeze(1).contiguous()
         attention_output = attention_output.reshape(batch_size, query_length, -1).contiguous()
         return module.o_proj(attention_output), None
 
@@ -362,6 +363,9 @@ class HuggingFaceBackend:
             "old_lengths": old_lengths,
         }
         try:
+            self._paged_context["page_table"], self._paged_context["lengths"] = (
+                self.kv_cache.device_page_table(self._paged_context["tables"])
+            )
             with torch.inference_mode():
                 output = self.model(
                     input_ids=ids,

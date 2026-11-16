@@ -114,3 +114,34 @@ python -m tinyllm \
   --max-model-len 4096 \
   --prompt "你好" \
   --max-tokens 64
+
+
+tmux usage
+
+sudo apt update
+sudo apt install tmux -y
+tmux new -s conda_setup
+tmux ls
+tmux attach -t conda_setup
+ctrl + B + D
+exit
+
+
+install the download python file
+
+python -m pip install \
+    "torch==2.11.0+cu130" \
+    --no-index \
+    --find-links=/root/wheels
+
+python3.12 -m pip download \
+    --pre \
+    "flash-attn-4[cu13]" \
+    --no-deps \
+    --only-binary=:all: \
+    -d ~/flash-attn4-wheels \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    --timeout 120 \
+    --retries 10
+
+python -m pip install --no-deps /root/flash_attn_4*.whl
