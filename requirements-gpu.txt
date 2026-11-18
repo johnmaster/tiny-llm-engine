@@ -145,3 +145,7 @@ python3.12 -m pip download \
     --retries 10
 
 python -m pip install --no-deps /root/flash_attn_4*.whl
+
+
+git fetch origin
+git reset --hard origin/main

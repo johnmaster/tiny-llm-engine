@@ -108,6 +108,9 @@ class Scheduler:
     def _release_request_state(self, req: Request) -> None:
         if req.state is None:
             return
+        block_table = getattr(req.state, "block_table", None)
+        if block_table is not None:
+            req.released_block_ids = list(block_table.block_ids)
         release_state = getattr(self.backend, "release_state", None)
         if release_state is not None:
             release_state(req.state)

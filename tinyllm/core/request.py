@@ -16,6 +16,7 @@ class Request:
     request_id: str = field(default_factory=lambda: f"req-{next(_ids)}")
     prompt_tokens: list[int] = field(default_factory=list)
     output_tokens: list[int] = field(default_factory=list)
+    released_block_ids: list[int] = field(default_factory=list)
     state: Any = None
     status: str = "waiting"
     error: str | None = None
