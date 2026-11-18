@@ -2,6 +2,8 @@
 from __future__ import annotations
 from typing import Protocol, Sequence
 
+from ..kv_cache import PrefixMatch
+
 
 class ModelBackend(Protocol):
     """A backend executes one batched prefill/decode operation per scheduler step."""
@@ -9,5 +11,6 @@ class ModelBackend(Protocol):
 
     def encode(self, prompt: str) -> list[int]: ...
     def decode(self, tokens: Sequence[int]) -> str: ...
-    def prefill(self, prompts: Sequence[Sequence[int]]) -> list[tuple[int, object]]: ...
+    def prefill(self, prompts: Sequence[Sequence[int]], *,
+                prefix_matches: Sequence[PrefixMatch] | None = None) -> list[tuple[int, object]]: ...
     def decode_step(self, tokens: Sequence[int], states: Sequence[object]) -> list[tuple[int, object, bool]]: ...

@@ -102,6 +102,39 @@ class PagedKVCacheManager:
                 self._ref_counts[block_id] += 1
             return BlockTable(list(table.block_ids), table.token_count, self._owner)
 
+    def table_from_blocks(self, block_ids: list[BlockId], token_count: int) -> BlockTable:
+        """Create an owned table referencing existing blocks."""
+        if token_count < 0 or len(block_ids) != self._blocks_for(token_count):
+            raise ValueError("block count does not match token_count")
+        if len(set(block_ids)) != len(block_ids):
+            raise ValueError("a physical block cannot appear twice in one block table")
+        with self._lock:
+            for block_id in block_ids:
+                self._validate_block_id(block_id)
+                if self._ref_counts[block_id] <= 0:
+                    raise ValueError(f"block {block_id} is not allocated")
+            for block_id in block_ids:
+                self._ref_counts[block_id] += 1
+            return BlockTable(list(block_ids), token_count, self._owner)
+
+    def retain_block(self, block_id: BlockId) -> None:
+        """Add one owner for an allocated physical block."""
+        self._validate_block_id(block_id)
+        with self._lock:
+            if self._ref_counts[block_id] <= 0:
+                raise ValueError(f"block {block_id} is not allocated")
+            self._ref_counts[block_id] += 1
+
+    def release_block(self, block_id: BlockId) -> None:
+        """Drop one owner for a physical block without releasing a whole table."""
+        self._validate_block_id(block_id)
+        with self._lock:
+            if self._ref_counts[block_id] <= 0:
+                raise ValueError(f"block {block_id} is not allocated")
+            self._ref_counts[block_id] -= 1
+            if self._ref_counts[block_id] == 0:
+                self._free.append(block_id)
+
     def ensure_writable(self, table: BlockTable, logical_block: int,
                         copy_block: CopyBlock | None = None) -> BlockId:
         """Return an unshared block for writing, copying shared contents as needed."""

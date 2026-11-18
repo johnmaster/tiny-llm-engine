@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from types import MethodType
 from typing import Any, Sequence
 
-from ..kv_cache import BlockTable, PagedKVTensorStore
+from ..kv_cache import BlockTable, PagedKVTensorStore, PrefixMatch
 
 
 @dataclass
@@ -504,7 +504,13 @@ class HuggingFaceBackend:
         return {"steps": result["requests"][0]["steps"],
                 "kernel_checks": result["kernel_checks"]}
 
-    def prefill(self, prompts: Sequence[Sequence[int]]) -> list[tuple[int, object]]:
+    def prefill(self, prompts: Sequence[Sequence[int]], *,
+                prefix_matches: Sequence[PrefixMatch] | None = None) -> list[tuple[int, object]]:
+        if prefix_matches is not None:
+            if len(prefix_matches) != len(prompts):
+                raise ValueError("prefix match count must equal prompt batch size")
+            if any(match.block_table is not None for match in prefix_matches):
+                return self._prefill_with_prefixes(prompts, prefix_matches)
         if not prompts:
             return []
         torch = self.torch
@@ -541,6 +547,129 @@ class HuggingFaceBackend:
                 self.kv_cache.release(table)
             raise
         return results
+
+    def _prefill_with_prefixes(
+        self,
+        suffixes: Sequence[Sequence[int]],
+        prefix_matches: Sequence[PrefixMatch],
+    ) -> list[tuple[int, object]]:
+        """Prefill only suffix tokens, attending to cached prefix KV pages."""
+        torch = self.torch
+        if not suffixes:
+            for match in prefix_matches:
+                if match.block_table is not None and not match.block_table._released:
+                    self.kv_cache.release(match.block_table)
+            return []
+        suffix_lengths = [len(suffix) for suffix in suffixes]
+        prefix_lengths = [match.matched_tokens for match in prefix_matches]
+        prefix_tables = [match.block_table for match in prefix_matches]
+        batch_size = len(suffixes)
+        tables: list[BlockTable] = [table for table in prefix_tables if table is not None]
+        created_tables: list[BlockTable] = []
+
+        try:
+            if len(prefix_matches) != batch_size:
+                raise ValueError("prefix match count must equal prompt batch size")
+            if any(length == 0 for length in suffix_lengths):
+                raise ValueError("prefix cache must leave at least one token for prefill")
+            if any((table is None) != (length == 0)
+                   for table, length in zip(prefix_tables, prefix_lengths)):
+                raise ValueError("prefix match table and token count are inconsistent")
+            if any(table is not None and table.token_count != length
+                   for table, length in zip(prefix_tables, prefix_lengths)):
+                raise ValueError("prefix match table length does not match its token count")
+            max_prefix = max(prefix_lengths, default=0)
+            width = max(suffix_lengths)
+            past_key_values = None
+            if max_prefix:
+                layer_caches = []
+                for layer_idx in range(self.kv_cache.num_layers):
+                    keys, values = [], []
+                    for table, prefix_len in zip(prefix_tables, prefix_lengths):
+                        if table is None:
+                            empty_shape = (1, self.kv_cache.num_kv_heads, 0,
+                                           self.kv_cache.head_dim)
+                            key = torch.empty(empty_shape, dtype=self.model.dtype,
+                                              device=self.device)
+                            value = torch.empty_like(key)
+                        else:
+                            key, value = self.kv_cache.gather_layer(table, layer_idx)
+                        missing = max_prefix - prefix_len
+                        if missing:
+                            # Left-pad cached rows so each row's valid prefix
+                            # stays adjacent to its suffix in the attention mask.
+                            key = torch.nn.functional.pad(key, (0, 0, missing, 0))
+                            value = torch.nn.functional.pad(value, (0, 0, missing, 0))
+                        keys.append(key)
+                        values.append(value)
+                    layer_caches.append((torch.cat(keys, dim=0), torch.cat(values, dim=0)))
+                past_key_values = self._cache_from_legacy(layer_caches)
+
+            ids = torch.full((batch_size, width), self.tokenizer.pad_token_id,
+                             dtype=torch.long, device=self.device)
+            attention_mask = torch.zeros(
+                (batch_size, max_prefix + width), dtype=torch.long, device=self.device
+            )
+            position_ids = torch.zeros((batch_size, width), dtype=torch.long,
+                                       device=self.device)
+            for row, (suffix, suffix_len, prefix_len) in enumerate(
+                zip(suffixes, suffix_lengths, prefix_lengths)
+            ):
+                ids[row, :suffix_len] = torch.tensor(
+                    suffix, dtype=torch.long, device=self.device
+                )
+                if prefix_len:
+                    attention_mask[row, max_prefix - prefix_len:max_prefix] = 1
+                attention_mask[row, max_prefix:max_prefix + suffix_len] = 1
+                position_ids[row, :suffix_len] = torch.arange(
+                    prefix_len, prefix_len + suffix_len,
+                    dtype=torch.long, device=self.device,
+                )
+
+            with torch.inference_mode():
+                output = self.model(
+                    input_ids=ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            logits = self._last_valid_logits(output.logits, suffix_lengths)
+            next_tokens = logits.argmax(dim=-1).tolist()
+            full_cache = self._legacy_cache(output.past_key_values)
+
+            results = []
+            for row, (suffix_len, prefix_len, token) in enumerate(
+                zip(suffix_lengths, prefix_lengths, next_tokens)
+            ):
+                table = prefix_tables[row]
+                if table is None:
+                    table = self.kv_cache.allocate(suffix_len)
+                    created_tables.append(table)
+                    write_start = 0
+                else:
+                    write_start = prefix_len
+                    self.kv_cache.append(table, suffix_len)
+                for layer_idx, (key, value) in enumerate(full_cache):
+                    key_tokens = key[
+                        row, :, max_prefix:max_prefix + suffix_len, :
+                    ].permute(1, 0, 2).contiguous()
+                    value_tokens = value[
+                        row, :, max_prefix:max_prefix + suffix_len, :
+                    ].permute(1, 0, 2).contiguous()
+                    self.kv_cache.write_layer(
+                        table, layer_idx, write_start, key_tokens, value_tokens
+                    )
+                results.append((int(token), _SequenceState(table)))
+            return results
+        except Exception:
+            released: set[int] = set()
+            for table in tables + created_tables:
+                if not table._released and id(table) not in released:
+                    self.kv_cache.release(table)
+                    released.add(id(table))
+            raise
 
     def decode_step(self, tokens: Sequence[int], states: Sequence[object]) -> list[tuple[int, object, bool]]:
         if not tokens:

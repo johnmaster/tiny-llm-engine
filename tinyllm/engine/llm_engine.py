@@ -39,6 +39,9 @@ class LLMEngine:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+        prefix_cache = getattr(self.scheduler, "prefix_cache", None)
+        if prefix_cache is not None and (self._thread is None or not self._thread.is_alive()):
+            prefix_cache.clear()
 
     def generate(self, prompt: str, max_tokens: int = 32, timeout: float = 300) -> Request:
         req = self.submit(prompt, max_tokens)

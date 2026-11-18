@@ -13,6 +13,9 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--enable-prefix-caching", action="store_true",
+                        help="reuse exact full KV blocks from earlier prompts")
+    parser.add_argument("--max-prefix-cache-blocks", type=int, default=256)
     parser.add_argument("--model", help="Hugging Face model name or local model path; enables CUDA inference")
     parser.add_argument("--device", default="cuda", help="device for --model (default: cuda)")
     parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto")
@@ -35,7 +38,9 @@ def main() -> None:
         backend = MockBackend()
         print("Using MockBackend; pass --model <path> on the GPU server for real inference.")
     engine = Engine(backend, config=EngineConfig(max_num_seqs=args.max_num_seqs,
-                                                  max_model_len=args.max_model_len))
+                                                  max_model_len=args.max_model_len,
+                                                  enable_prefix_caching=args.enable_prefix_caching,
+                                                  max_prefix_cache_blocks=args.max_prefix_cache_blocks))
     try:
         req = engine.generate(args.prompt, args.max_tokens)
         attention_summary = getattr(backend, "attention_summary", None)
@@ -46,6 +51,9 @@ def main() -> None:
         kv_cache_summary = getattr(backend, "kv_cache_summary", None)
         if kv_cache_summary is not None:
             print(kv_cache_summary())
+        prefix_stats = engine.scheduler.stats().get("prefix_cache")
+        if prefix_stats is not None:
+            print(f"Prefix cache: {prefix_stats}")
         print(engine.backend.decode(req.output_tokens))
     finally:
         engine.shutdown()

@@ -6,6 +6,7 @@ from typing import Any
 
 from ..core import Request
 from ..config import EngineConfig
+from ..kv_cache import ExactPrefixCache, KVCacheOutOfBlocks
 from ..model_executor.backend import ModelBackend
 
 
@@ -17,6 +18,11 @@ class Scheduler:
         self._waiting: deque[Request] = deque()
         self._running: list[Request] = []
         self._lock = RLock()
+        manager = getattr(getattr(backend, "kv_cache", None), "manager", None)
+        self.prefix_cache = (
+            ExactPrefixCache(manager, config.max_prefix_cache_blocks)
+            if config.enable_prefix_caching and manager is not None else None
+        )
 
     def add_request(self, prompt: str, max_tokens: int = 32) -> Request:
         if not isinstance(prompt, str):
@@ -48,7 +54,28 @@ class Scheduler:
         try:
             # New requests can join the batch while older requests are decoding.
             if fresh:
-                outputs = self.backend.prefill([r.prompt_tokens for r in fresh])
+                if self.prefix_cache is not None:
+                    matches = [self.prefix_cache.match(req.prompt_tokens) for req in fresh]
+                    for req, match in zip(fresh, matches):
+                        req.prefix_cached_tokens = match.matched_tokens
+                    suffixes = [
+                        req.prompt_tokens[match.matched_tokens:]
+                        for req, match in zip(fresh, matches)
+                    ]
+                    try:
+                        outputs = self.backend.prefill(suffixes, prefix_matches=matches)
+                    except KVCacheOutOfBlocks:
+                        # Cache references are optional. Drop them and retry
+                        # this batch from its complete prompts under pressure.
+                        self.prefix_cache.clear()
+                        for req in fresh:
+                            req.prefix_cached_tokens = 0
+                        outputs = self.backend.prefill(
+                            [req.prompt_tokens for req in fresh]
+                        )
+                else:
+                    matches = None
+                    outputs = self.backend.prefill([r.prompt_tokens for r in fresh])
                 if len(outputs) != len(fresh):
                     raise RuntimeError("backend prefill returned the wrong batch size")
                 for req, (token, state) in zip(fresh, outputs):
@@ -58,6 +85,8 @@ class Scheduler:
                             self._release_request_state(req)
                             req.ready.set()
                         else:
+                            if self.prefix_cache is not None:
+                                self.prefix_cache.insert(req.prompt_tokens, state.block_table)
                             req.output_tokens.append(token)
                             if self._done(req):
                                 self._finish(req)
@@ -134,6 +163,9 @@ class Scheduler:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            return {"waiting": len(self._waiting), "running": len(self._running),
-                    "max_num_seqs": self.max_num_seqs,
-                    "max_model_len": self.config.max_model_len}
+            stats = {"waiting": len(self._waiting), "running": len(self._running),
+                     "max_num_seqs": self.max_num_seqs,
+                     "max_model_len": self.config.max_model_len}
+            if self.prefix_cache is not None:
+                stats["prefix_cache"] = self.prefix_cache.snapshot()
+            return stats
