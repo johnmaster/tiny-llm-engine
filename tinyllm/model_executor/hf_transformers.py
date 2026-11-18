@@ -214,6 +214,40 @@ class HuggingFaceBackend:
             layer_idx, query[:, :, 0, :], context["page_table"],
             context["lengths"], float(module.scaling),
         )
+        if "kernel_checks" in context:
+            query_heads = query.shape[1]
+            groups = query_heads // self.kv_cache.num_kv_heads
+            for row, table in enumerate(context["tables"]):
+                dense_key, dense_value = self.kv_cache.gather_layer(table, layer_idx)
+                dense_key = dense_key[0].repeat_interleave(groups, dim=0).float()
+                dense_value = dense_value[0].repeat_interleave(groups, dim=0).float()
+                query_fp32 = query[row, :, 0, :].float()
+                scores = torch.einsum("hd,hld->hl", query_fp32, dense_key)
+                probabilities = torch.softmax(scores * float(module.scaling), dim=-1)
+                reference_output = torch.einsum(
+                    "hl,hld->hd", probabilities, dense_value
+                ).to(dtype=attention_output.dtype)
+                actual_output = attention_output[row]
+                error = (reference_output.float() - actual_output.float()).abs()
+                reference_norm = torch.linalg.vector_norm(reference_output.float())
+                relative_l2 = torch.linalg.vector_norm(error) / reference_norm.clamp_min(1e-12)
+                cosine = torch.nn.functional.cosine_similarity(
+                    reference_output.float().reshape(1, -1),
+                    actual_output.float().reshape(1, -1),
+                )[0]
+                context["kernel_checks"].append({
+                    "step": context["kernel_step"],
+                    "request": row,
+                    "layer": layer_idx,
+                    "max_abs_error": float(error.max().item()),
+                    "mean_abs_error": float(error.mean().item()),
+                    "relative_l2_error": float(relative_l2.item()),
+                    "cosine_similarity": float(cosine.item()),
+                    "close": bool(torch.allclose(
+                        reference_output, actual_output,
+                        atol=context["kernel_atol"], rtol=context["kernel_rtol"],
+                    )),
+                })
         self._paged_attention_calls[layer_idx] += 1
         attention_output = attention_output.unsqueeze(1).contiguous()
         attention_output = attention_output.reshape(batch_size, query_length, -1).contiguous()
@@ -260,6 +294,215 @@ class HuggingFaceBackend:
         # Prefill input rows are right-padded, so each row's last prompt token is
         # at length - 1 (not at the final padded column).
         return logits[range(len(lengths)), [length - 1 for length in lengths], :]
+
+    def compare_paged_decode_batch(self, prompt_batches: Sequence[Sequence[Sequence[int]]],
+                                   *, steps: int = 4, atol: float = 5e-2,
+                                   rtol: float = 5e-2, kernel_atol: float = 1e-2,
+                                   kernel_rtol: float = 1e-2) -> dict[str, Any]:
+        """Compare mixed-length Triton paged decode against dense SDPA and eager."""
+        if not self._paged_decode_enabled:
+            raise RuntimeError("decode comparison currently supports patched Qwen3 only")
+        prompts = [list(prompt) for prompt in prompt_batches]
+        if not prompts or any(not prompt for prompt in prompts):
+            raise ValueError("prompt batch and each prompt must be nonempty")
+        if len(prompts) > self.kv_cache.manager.num_blocks:
+            raise ValueError("batch is larger than the configured KV page pool")
+        if steps < 1:
+            raise ValueError("steps must be at least 1")
+        prompt_lengths = [len(prompt) for prompt in prompts]
+        max_prompt_length = max(prompt_lengths)
+        if max_prompt_length + steps > self.kv_cache.manager.num_blocks * self.kv_block_size:
+            raise ValueError("prompt plus steps exceeds the allocated paged KV capacity")
+
+        torch = self.torch
+        batch_size = len(prompts)
+        block_tables: list[BlockTable] = []
+        requests = [{"index": row, "prompt_length": length, "steps": []}
+                    for row, length in enumerate(prompt_lengths)]
+        kernel_checks: list[dict[str, Any]] = []
+
+        def clone_dense_cache(cache: Any) -> Any:
+            return self._cache_from_legacy(tuple(
+                (key.clone(), value.clone()) for key, value in self._legacy_cache(cache)
+            ))
+
+        def dense_decode(cache: Any, token_ids: Any, mask: Any, positions: Any,
+                         attention_impl: str) -> Any:
+            original_backends: dict[int, tuple[Any, Any]] = {}
+            try:
+                for _, module in self._attention_modules:
+                    config = module.config
+                    config_id = id(config)
+                    if config_id not in original_backends:
+                        original_backends[config_id] = (
+                            config, getattr(config, "_attn_implementation", None)
+                        )
+                    config._attn_implementation = attention_impl
+                self._paged_context = None
+                with torch.inference_mode():
+                    return self.model(
+                        input_ids=token_ids,
+                        attention_mask=mask,
+                        position_ids=positions,
+                        past_key_values=cache,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+            finally:
+                for config, original in original_backends.values():
+                    config._attn_implementation = original
+
+        def logits_metrics(reference: Any, candidate: Any) -> dict[str, Any]:
+            difference = (reference - candidate).abs()
+            relative_l2 = (torch.linalg.vector_norm(difference)
+                           / torch.linalg.vector_norm(reference).clamp_min(1e-12))
+            cosine = torch.nn.functional.cosine_similarity(
+                reference.reshape(1, -1), candidate.reshape(1, -1)
+            )[0]
+            top_k = min(10, reference.numel())
+            reference_top = torch.topk(reference, top_k)
+            candidate_top = torch.topk(candidate, top_k)
+            overlap = len(set(reference_top.indices.tolist())
+                          & set(candidate_top.indices.tolist())) / top_k
+            max_index = int(difference.argmax().item())
+            top_two = torch.topk(reference, min(2, reference.numel())).values
+            margin = top_two[0] - top_two[1] if top_two.numel() > 1 else top_two[0]
+            return {
+                "max_abs_error": float(difference[max_index].item()),
+                "mean_abs_error": float(difference.mean().item()),
+                "relative_l2_error": float(relative_l2.item()),
+                "cosine_similarity": float(cosine.item()),
+                "top10_overlap": float(overlap),
+                "max_error_token_id": max_index,
+                "reference_at_max_error": float(reference[max_index].item()),
+                "candidate_at_max_error": float(candidate[max_index].item()),
+                "reference_top1_margin": float(margin.item()),
+                "allclose": bool(torch.allclose(reference, candidate, atol=atol, rtol=rtol)),
+            }
+
+        try:
+            width = max_prompt_length
+            input_ids = torch.full((batch_size, width), self.tokenizer.pad_token_id,
+                                   dtype=torch.long, device=self.device)
+            attention_mask = torch.zeros((batch_size, width), dtype=torch.long,
+                                         device=self.device)
+            for row, prompt in enumerate(prompts):
+                length = prompt_lengths[row]
+                input_ids[row, :length] = torch.tensor(prompt, dtype=torch.long,
+                                                        device=self.device)
+                attention_mask[row, :length] = 1
+            position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp_min(0)
+            with torch.inference_mode():
+                prefill_output = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            prefill_cache = prefill_output.past_key_values
+            sdpa_cache = clone_dense_cache(prefill_cache)
+            eager_cache = clone_dense_cache(prefill_cache)
+            layer_cache = self._legacy_cache(prefill_cache)
+            for row, length in enumerate(prompt_lengths):
+                table = self.kv_cache.allocate(length)
+                block_tables.append(table)
+                for layer_idx, (key, value) in enumerate(layer_cache):
+                    key_tokens = key[row, :, :length, :].permute(1, 0, 2).contiguous()
+                    value_tokens = value[row, :, :length, :].permute(1, 0, 2).contiguous()
+                    self.kv_cache.write_layer(table, layer_idx, 0, key_tokens, value_tokens)
+
+            initial_logits = self._last_valid_logits(prefill_output.logits, prompt_lengths)
+            next_tokens = initial_logits.argmax(dim=-1)
+            del prefill_output, prefill_cache, layer_cache
+
+            for step in range(steps):
+                physical_width = width + step
+                decode_ids = next_tokens.to(device=self.device, dtype=torch.long).unsqueeze(1)
+                dense_mask = torch.zeros((batch_size, physical_width + 1), dtype=torch.long,
+                                         device=self.device)
+                for row, length in enumerate(prompt_lengths):
+                    dense_mask[row, :length] = 1
+                    dense_mask[row, width:physical_width + 1] = 1
+                decode_positions = torch.tensor(
+                    [[length + step] for length in prompt_lengths],
+                    dtype=torch.long, device=self.device,
+                )
+
+                sdpa_output = dense_decode(
+                    sdpa_cache, decode_ids, dense_mask, decode_positions, "sdpa"
+                )
+                sdpa_cache = sdpa_output.past_key_values
+                reference_logits = sdpa_output.logits[:, -1, :].float()
+                eager_output = dense_decode(
+                    eager_cache, decode_ids, dense_mask, decode_positions, "eager"
+                )
+                eager_cache = eager_output.past_key_values
+                eager_logits = eager_output.logits[:, -1, :].float()
+
+                for table in block_tables:
+                    self.kv_cache.append(table, 1)
+                page_table, lengths_tensor = self.kv_cache.device_page_table(block_tables)
+                self._paged_context = {
+                    "tables": block_tables,
+                    "old_lengths": [length + step for length in prompt_lengths],
+                    "page_table": page_table,
+                    "lengths": lengths_tensor,
+                    "kernel_checks": kernel_checks,
+                    "kernel_step": step + 1,
+                    "kernel_atol": kernel_atol,
+                    "kernel_rtol": kernel_rtol,
+                }
+                with torch.inference_mode():
+                    paged_output = self.model(
+                        input_ids=decode_ids,
+                        attention_mask=None,
+                        position_ids=decode_positions,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                self._paged_context = None
+                paged_logits = paged_output.logits[:, -1, :].float()
+                for row in range(batch_size):
+                    ref = reference_logits[row]
+                    eager = eager_logits[row]
+                    paged = paged_logits[row]
+                    paged_metrics = logits_metrics(ref, paged)
+                    eager_metrics = logits_metrics(ref, eager)
+                    reference_token = int(ref.argmax().item())
+                    paged_token = int(paged.argmax().item())
+                    requests[row]["steps"].append({
+                        "step": step + 1,
+                        "kv_length": prompt_lengths[row] + step + 1,
+                        **paged_metrics,
+                        "dense_backend_max_abs_error": eager_metrics["max_abs_error"],
+                        "dense_backend_mean_abs_error": eager_metrics["mean_abs_error"],
+                        "dense_backend_relative_l2_error": eager_metrics["relative_l2_error"],
+                        "dense_backend_cosine_similarity": eager_metrics["cosine_similarity"],
+                        "dense_backend_top10_overlap": eager_metrics["top10_overlap"],
+                        "dense_backend_logits_close": eager_metrics["allclose"],
+                        "dense_backend_token_match": (
+                            reference_token == int(eager.argmax().item())
+                        ),
+                        "reference_token": reference_token,
+                        "paged_token": paged_token,
+                        "token_match": reference_token == paged_token,
+                        "logits_close": paged_metrics["allclose"],
+                    })
+                next_tokens = reference_logits.argmax(dim=-1)
+
+            return {"requests": requests, "kernel_checks": kernel_checks}
+        finally:
+            self._paged_context = None
+            for table in block_tables:
+                if not table._released:
+                    self.kv_cache.release(table)
+
+    def compare_paged_decode(self, prompt_tokens: Sequence[int], **kwargs: Any) -> dict[str, Any]:
+        """Single-request convenience wrapper for ``compare_paged_decode_batch``."""
+        result = self.compare_paged_decode_batch([prompt_tokens], **kwargs)
+        return {"steps": result["requests"][0]["steps"],
+                "kernel_checks": result["kernel_checks"]}
 
     def prefill(self, prompts: Sequence[Sequence[int]]) -> list[tuple[int, object]]:
         if not prompts:
