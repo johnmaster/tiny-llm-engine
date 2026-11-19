@@ -80,6 +80,7 @@ class HuggingFaceBackend:
             )
         self.attention_backend = attention_backend
         self._attention_calls: dict[str, int] = {}
+        self._attention_output_capture: dict[str, Any] | None = None
         self._attention_layers: list[tuple[str, str]] = []
         self._attention_modules: list[tuple[str, Any]] = []
         for name, module in self.model.named_modules():
@@ -95,6 +96,10 @@ class HuggingFaceBackend:
             def count_attention_call(_module: Any, _inputs: Any, _output: Any,
                                      layer_name: str = name) -> None:
                 self._attention_calls[layer_name] += 1
+                if self._attention_output_capture is not None:
+                    attention_output = _output[0] if isinstance(_output, tuple) else _output
+                    if isinstance(attention_output, self.torch.Tensor):
+                        self._attention_output_capture[layer_name] = attention_output.detach()
 
             module.register_forward_hook(count_attention_call)
 
@@ -142,9 +147,11 @@ class HuggingFaceBackend:
         )
         if self._paged_decode_enabled:
             self._paged_attention_calls = [0] * len(self._attention_modules)
+            self._paged_prefill_calls = [0] * len(self._attention_modules)
             self._install_qwen3_paged_attention()
         else:
             self._paged_attention_calls = []
+            self._paged_prefill_calls = []
         if getattr(config, "model_type", None) == "qwen3" and not self._paged_decode_enabled:
             raise RuntimeError("This Transformers Qwen3 implementation cannot be patched for paged decode")
 
@@ -154,13 +161,16 @@ class HuggingFaceBackend:
             return None
         total = len(self._attention_layers)
         invoked = sum(self._attention_calls[name] > 0 for name, _ in self._attention_layers)
+        prefill_layers = sum(count > 0 for count in self._paged_prefill_calls)
         if self._paged_decode_enabled:
             paged_layers = sum(count > 0 for count in self._paged_attention_calls)
             decode_mode = f"Triton paged decode {paged_layers}/{len(self._paged_attention_calls)} layers"
         else:
             decode_mode = "HF dense cache"
+        prefill_mode = (f"Triton paged prefill {prefill_layers}/{total} layers"
+                        if prefill_layers else self.attention_backend)
         return (f"Attention layers executed: {invoked}/{total}; "
-                f"prefill backend: {self.attention_backend}; decode: {decode_mode}")
+                f"prefill backend: {prefill_mode}; decode: {decode_mode}")
 
     def kv_cache_summary(self) -> str:
         stats = self.kv_cache.manager.snapshot()
@@ -188,13 +198,11 @@ class HuggingFaceBackend:
 
     def _qwen3_paged_attention_forward(self, module: Any, context: dict[str, Any],
                                        hidden_states: Any, **kwargs: Any) -> tuple[Any, None]:
-        """Qwen3 single-token attention over the request's physical KV pages."""
+        """Qwen3 causal attention over the request's physical KV pages."""
         from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
         torch = self.torch
         batch_size, query_length, _ = hidden_states.shape
-        if query_length != 1:
-            raise RuntimeError("paged decode currently supports one query token per sequence")
         position_embeddings = kwargs.get("position_embeddings")
         if position_embeddings is None:
             raise RuntimeError("Qwen3 did not provide rotary position embeddings")
@@ -206,51 +214,120 @@ class HuggingFaceBackend:
         query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
 
         layer_idx = int(module.layer_idx)
-        for row, (table, old_length) in enumerate(zip(context["tables"], context["old_lengths"])):
-            self.kv_cache.write_layer(
-                table, layer_idx, old_length,
-                key[row, :, 0, :].unsqueeze(0), value[row, :, 0, :].unsqueeze(0),
+        if context.get("mode", "decode") == "prefill":
+            query_lengths = context["query_lengths"]
+            for row, (table, old_length, valid_length) in enumerate(zip(
+                context["tables"], context["old_lengths"], query_lengths
+            )):
+                self.kv_cache.write_layer(
+                    table, layer_idx, old_length,
+                    key[row, :, :valid_length, :].permute(1, 0, 2).contiguous(),
+                    value[row, :, :valid_length, :].permute(1, 0, 2).contiguous(),
+                )
+            attention_output = self.kv_cache.paged_prefill_attention(
+                layer_idx, query, context["page_table"],
+                context["old_lengths_tensor"], context["query_lengths_tensor"],
+                float(module.scaling),
             )
-        attention_output = self.kv_cache.paged_attention(
-            layer_idx, query[:, :, 0, :], context["page_table"],
-            context["lengths"], float(module.scaling),
-        )
-        if "kernel_checks" in context:
-            query_heads = query.shape[1]
-            groups = query_heads // self.kv_cache.num_kv_heads
-            for row, table in enumerate(context["tables"]):
-                dense_key, dense_value = self.kv_cache.gather_layer(table, layer_idx)
-                dense_key = dense_key[0].repeat_interleave(groups, dim=0).float()
-                dense_value = dense_value[0].repeat_interleave(groups, dim=0).float()
-                query_fp32 = query[row, :, 0, :].float()
-                scores = torch.einsum("hd,hld->hl", query_fp32, dense_key)
-                probabilities = torch.softmax(scores * float(module.scaling), dim=-1)
-                reference_output = torch.einsum(
-                    "hl,hld->hd", probabilities, dense_value
-                ).to(dtype=attention_output.dtype)
-                actual_output = attention_output[row]
-                error = (reference_output.float() - actual_output.float()).abs()
-                reference_norm = torch.linalg.vector_norm(reference_output.float())
-                relative_l2 = torch.linalg.vector_norm(error) / reference_norm.clamp_min(1e-12)
-                cosine = torch.nn.functional.cosine_similarity(
-                    reference_output.float().reshape(1, -1),
-                    actual_output.float().reshape(1, -1),
-                )[0]
-                context["kernel_checks"].append({
-                    "step": context["kernel_step"],
-                    "request": row,
-                    "layer": layer_idx,
-                    "max_abs_error": float(error.max().item()),
-                    "mean_abs_error": float(error.mean().item()),
-                    "relative_l2_error": float(relative_l2.item()),
-                    "cosine_similarity": float(cosine.item()),
-                    "close": bool(torch.allclose(
-                        reference_output, actual_output,
-                        atol=context["kernel_atol"], rtol=context["kernel_rtol"],
-                    )),
-                })
-        self._paged_attention_calls[layer_idx] += 1
-        attention_output = attention_output.unsqueeze(1).contiguous()
+            if "kernel_checks" in context:
+                query_heads = query.shape[1]
+                groups = query_heads // self.kv_cache.num_kv_heads
+                for row, (table, old_length, valid_length) in enumerate(zip(
+                    context["tables"], context["old_lengths"], query_lengths
+                )):
+                    dense_key, dense_value = self.kv_cache.gather_layer(table, layer_idx)
+                    dense_key = dense_key[0].repeat_interleave(groups, dim=0).float()
+                    dense_value = dense_value[0].repeat_interleave(groups, dim=0).float()
+                    query_fp32 = query[row, :, :valid_length, :].float()
+                    valid_kv_length = old_length + valid_length
+                    key_positions = torch.arange(valid_kv_length, device=self.device)
+                    query_limits = old_length + torch.arange(valid_length, device=self.device)
+                    scores = torch.einsum(
+                        "hqd,hkd->hqk", query_fp32,
+                        dense_key[:, :valid_kv_length, :],
+                    ) * float(module.scaling)
+                    causal_mask = key_positions[None, :] > query_limits[:, None]
+                    scores = scores.masked_fill(causal_mask[None, :, :], float("-inf"))
+                    probabilities = torch.softmax(scores, dim=-1)
+                    reference_output = torch.einsum(
+                        "hqk,hkd->hqd", probabilities,
+                        dense_value[:, :valid_kv_length, :],
+                    ).permute(1, 0, 2).to(dtype=attention_output.dtype)
+                    actual_output = attention_output[row, :, :valid_length, :].permute(1, 0, 2)
+                    error = (reference_output.float() - actual_output.float()).abs()
+                    reference_norm = torch.linalg.vector_norm(reference_output.float())
+                    relative_l2 = torch.linalg.vector_norm(error) / reference_norm.clamp_min(1e-12)
+                    cosine = torch.nn.functional.cosine_similarity(
+                        reference_output.float().reshape(1, -1),
+                        actual_output.float().reshape(1, -1),
+                    )[0]
+                    context["kernel_checks"].append({
+                        "mode": "prefill",
+                        "step": context.get("chunk_index", 0),
+                        "request": row,
+                        "layer": layer_idx,
+                        "query_tokens": valid_length,
+                        "max_abs_error": float(error.max().item()),
+                        "mean_abs_error": float(error.mean().item()),
+                        "relative_l2_error": float(relative_l2.item()),
+                        "cosine_similarity": float(cosine.item()),
+                        "close": bool(torch.allclose(
+                            reference_output, actual_output,
+                            atol=context["kernel_atol"], rtol=context["kernel_rtol"],
+                        )),
+                    })
+            attention_output = attention_output.transpose(1, 2).contiguous()
+            self._paged_prefill_calls[layer_idx] += 1
+        else:
+            if query_length != 1:
+                raise RuntimeError("paged decode only supports one query token per sequence")
+            for row, (table, old_length) in enumerate(
+                zip(context["tables"], context["old_lengths"])
+            ):
+                self.kv_cache.write_layer(
+                    table, layer_idx, old_length,
+                    key[row, :, 0, :].unsqueeze(0), value[row, :, 0, :].unsqueeze(0),
+                )
+            attention_output = self.kv_cache.paged_attention(
+                layer_idx, query[:, :, 0, :], context["page_table"],
+                context["lengths"], float(module.scaling),
+            )
+            if "kernel_checks" in context:
+                query_heads = query.shape[1]
+                groups = query_heads // self.kv_cache.num_kv_heads
+                for row, table in enumerate(context["tables"]):
+                    dense_key, dense_value = self.kv_cache.gather_layer(table, layer_idx)
+                    dense_key = dense_key[0].repeat_interleave(groups, dim=0).float()
+                    dense_value = dense_value[0].repeat_interleave(groups, dim=0).float()
+                    query_fp32 = query[row, :, 0, :].float()
+                    scores = torch.einsum("hd,hld->hl", query_fp32, dense_key)
+                    probabilities = torch.softmax(scores * float(module.scaling), dim=-1)
+                    reference_output = torch.einsum(
+                        "hl,hld->hd", probabilities, dense_value
+                    ).to(dtype=attention_output.dtype)
+                    actual_output = attention_output[row]
+                    error = (reference_output.float() - actual_output.float()).abs()
+                    reference_norm = torch.linalg.vector_norm(reference_output.float())
+                    relative_l2 = torch.linalg.vector_norm(error) / reference_norm.clamp_min(1e-12)
+                    cosine = torch.nn.functional.cosine_similarity(
+                        reference_output.float().reshape(1, -1),
+                        actual_output.float().reshape(1, -1),
+                    )[0]
+                    context["kernel_checks"].append({
+                        "step": context["kernel_step"],
+                        "request": row,
+                        "layer": layer_idx,
+                        "max_abs_error": float(error.max().item()),
+                        "mean_abs_error": float(error.mean().item()),
+                        "relative_l2_error": float(relative_l2.item()),
+                        "cosine_similarity": float(cosine.item()),
+                        "close": bool(torch.allclose(
+                            reference_output, actual_output,
+                            atol=context["kernel_atol"], rtol=context["kernel_rtol"],
+                        )),
+                    })
+            self._paged_attention_calls[layer_idx] += 1
+            attention_output = attention_output.unsqueeze(1).contiguous()
         attention_output = attention_output.reshape(batch_size, query_length, -1).contiguous()
         return module.o_proj(attention_output), None
 
@@ -295,6 +372,136 @@ class HuggingFaceBackend:
         # Prefill input rows are right-padded, so each row's last prompt token is
         # at length - 1 (not at the final padded column).
         return logits[range(len(lengths)), [length - 1 for length in lengths], :]
+
+    def compare_paged_prefill(
+        self,
+        prompt_batches: Sequence[Sequence[int]],
+        *,
+        chunk_size: int = 32,
+        kernel_atol: float = 1e-2,
+        kernel_rtol: float = 1e-2,
+    ) -> dict[str, Any]:
+        """Compare FA4/HF dense prefill with direct Triton paged prefill."""
+        if not self._paged_decode_enabled:
+            raise RuntimeError("paged prefill comparison currently supports patched Qwen3 only")
+        prompts = [list(prompt) for prompt in prompt_batches]
+        if not prompts or any(not prompt for prompt in prompts):
+            raise ValueError("prompt batch and each prompt must be nonempty")
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be at least 1")
+
+        dense_logits_capture: list[Any] = []
+        dense_attention_capture: dict[str, Any] = {}
+        self._attention_output_capture = dense_attention_capture
+        try:
+            dense_outputs = self.prefill(prompts, logits_capture=dense_logits_capture)
+        finally:
+            self._attention_output_capture = None
+        dense_tokens = [token for token, _ in dense_outputs]
+        dense_logits = dense_logits_capture[0].cpu()
+        dense_layer_outputs: dict[int, list[Any]] = {}
+        for layer_idx, (name, _) in enumerate(self._attention_modules):
+            layer_output = dense_attention_capture.get(name)
+            if layer_output is not None:
+                dense_layer_outputs[layer_idx] = [
+                    layer_output[row, len(prompt) - 1].float().cpu()
+                    for row, prompt in enumerate(prompts)
+                ]
+        del dense_attention_capture
+        for _, state in dense_outputs:
+            self.release_state(state)
+
+        cursors = [0] * len(prompts)
+        states: list[object | None] = [None] * len(prompts)
+        paged_tokens: list[int | None] = [None] * len(prompts)
+        paged_logits: list[Any | None] = [None] * len(prompts)
+        paged_layer_outputs: list[dict[int, Any]] = [{} for _ in prompts]
+        kernel_checks: list[dict[str, Any]] = []
+        chunk_index = 0
+        try:
+            while any(cursor < len(prompt) for cursor, prompt in zip(cursors, prompts)):
+                rows = [index for index, (cursor, prompt) in enumerate(zip(cursors, prompts))
+                        if cursor < len(prompt)]
+                chunks = [
+                    prompts[index][cursors[index]:cursors[index] + chunk_size]
+                    for index in rows
+                ]
+                final_chunks = [
+                    cursors[index] + len(chunk) == len(prompts[index])
+                    for index, chunk in zip(rows, chunks)
+                ]
+                chunk_logits: list[Any] = []
+                chunk_attention_capture: dict[str, Any] = {}
+                self._attention_output_capture = chunk_attention_capture
+                try:
+                    outputs = self.prefill_chunk(
+                        chunks,
+                        [states[index] for index in rows],
+                        [None] * len(rows),
+                        final_chunks,
+                        prefill_backend="triton_paged",
+                        kernel_checks=kernel_checks,
+                        kernel_atol=kernel_atol,
+                        kernel_rtol=kernel_rtol,
+                        chunk_index=chunk_index,
+                        logits_capture=chunk_logits,
+                    )
+                finally:
+                    self._attention_output_capture = None
+                for layer_idx, (name, _) in enumerate(self._attention_modules):
+                    layer_output = chunk_attention_capture.get(name)
+                    if layer_output is None:
+                        continue
+                    for local_row, (global_row, chunk, final) in enumerate(
+                        zip(rows, chunks, final_chunks)
+                    ):
+                        if final:
+                            paged_layer_outputs[global_row][layer_idx] = (
+                                layer_output[local_row, len(chunk) - 1].float().cpu()
+                            )
+                del chunk_attention_capture
+                for index, chunk, final, (token, state), row_logits in zip(
+                    rows, chunks, final_chunks, outputs, chunk_logits
+                ):
+                    states[index] = state
+                    cursors[index] += len(chunk)
+                    if token is not None:
+                        paged_tokens[index] = token
+                    if final:
+                        paged_logits[index] = row_logits
+                chunk_index += 1
+            attention_output_checks = []
+            for request_idx in range(len(prompts)):
+                for layer_idx, dense_rows in dense_layer_outputs.items():
+                    paged_output = paged_layer_outputs[request_idx].get(layer_idx)
+                    if paged_output is None:
+                        continue
+                    reference = dense_rows[request_idx]
+                    error = (reference - paged_output).abs()
+                    attention_output_checks.append({
+                        "request": request_idx,
+                        "layer": layer_idx,
+                        "max_abs_error": float(error.max().item()),
+                        "mean_abs_error": float(error.mean().item()),
+                        "close": bool(self.torch.allclose(
+                            reference, paged_output,
+                            atol=kernel_atol, rtol=kernel_rtol,
+                        )),
+                    })
+            return {
+                "dense_tokens": dense_tokens,
+                "paged_tokens": paged_tokens,
+                "dense_logits": dense_logits,
+                "paged_logits": self.torch.stack(paged_logits).cpu(),
+                "kernel_checks": kernel_checks,
+                "attention_output_checks": attention_output_checks,
+                "chunk_count": chunk_index,
+            }
+        finally:
+            self._paged_context = None
+            for state in states:
+                if state is not None:
+                    self.release_state(state)
 
     def compare_paged_decode_batch(self, prompt_batches: Sequence[Sequence[Sequence[int]]],
                                    *, steps: int = 4, atol: float = 5e-2,
@@ -511,6 +718,13 @@ class HuggingFaceBackend:
         states: Sequence[object | None],
         prefix_matches: Sequence[PrefixMatch | None],
         final_chunks: Sequence[bool],
+        *,
+        prefill_backend: str = "hf",
+        kernel_checks: list[dict[str, Any]] | None = None,
+        kernel_atol: float = 1e-2,
+        kernel_rtol: float = 1e-2,
+        chunk_index: int = 0,
+        logits_capture: list[Any] | None = None,
     ) -> list[tuple[int | None, object]]:
         """Append one prefill chunk per sequence and return logits when complete."""
         if not token_chunks:
@@ -522,6 +736,10 @@ class HuggingFaceBackend:
         chunk_lengths = [len(chunk) for chunk in token_chunks]
         if any(length == 0 for length in chunk_lengths):
             raise ValueError("prefill chunks must contain at least one token")
+        if prefill_backend not in ("hf", "triton_paged"):
+            raise ValueError("prefill_backend must be 'hf' or 'triton_paged'")
+        if prefill_backend == "triton_paged" and not self._paged_decode_enabled:
+            raise RuntimeError("Triton paged prefill currently supports patched Qwen3 only")
         old_lengths: list[int] = []
         tables: list[BlockTable | None] = []
         match_owned_tables: list[BlockTable] = []
@@ -563,8 +781,41 @@ class HuggingFaceBackend:
 
             max_past = max(old_lengths, default=0)
             width = max(chunk_lengths)
+            if prefill_backend == "triton_paged":
+                for row, chunk_length in enumerate(chunk_lengths):
+                    table = tables[row]
+                    if table is None:
+                        table = self.kv_cache.allocate(chunk_length)
+                        created_tables.append(table)
+                        tables[row] = table
+                    else:
+                        self.kv_cache.append(table, chunk_length)
+                page_table, _ = self.kv_cache.device_page_table(
+                    [table for table in tables if table is not None]
+                )
+                self._paged_context = {
+                    "mode": "prefill",
+                    "tables": tables,
+                    "old_lengths": old_lengths,
+                    "query_lengths": chunk_lengths,
+                    "page_table": page_table,
+                    "old_lengths_tensor": torch.tensor(
+                        old_lengths, dtype=torch.int32, device=self.device
+                    ),
+                    "query_lengths_tensor": torch.tensor(
+                        chunk_lengths, dtype=torch.int32, device=self.device
+                    ),
+                    "chunk_index": chunk_index,
+                }
+                if kernel_checks is not None:
+                    self._paged_context.update({
+                        "kernel_checks": kernel_checks,
+                        "kernel_atol": kernel_atol,
+                        "kernel_rtol": kernel_rtol,
+                    })
+
             past_key_values = None
-            if max_past:
+            if max_past and prefill_backend == "hf":
                 layer_caches = []
                 for layer_idx in range(self.kv_cache.num_layers):
                     keys, values = [], []
@@ -590,9 +841,11 @@ class HuggingFaceBackend:
                 (batch_size, width), self.tokenizer.pad_token_id,
                 dtype=torch.long, device=self.device,
             )
-            attention_mask = torch.zeros(
-                (batch_size, max_past + width), dtype=torch.long, device=self.device
-            )
+            attention_mask = None
+            if prefill_backend == "hf":
+                attention_mask = torch.zeros(
+                    (batch_size, max_past + width), dtype=torch.long, device=self.device
+                )
             position_ids = torch.zeros((batch_size, width), dtype=torch.long,
                                        device=self.device)
             for row, (chunk, chunk_length, old_length) in enumerate(
@@ -601,50 +854,64 @@ class HuggingFaceBackend:
                 input_ids[row, :chunk_length] = torch.tensor(
                     chunk, dtype=torch.long, device=self.device
                 )
-                if old_length:
+                if old_length and prefill_backend == "hf":
                     attention_mask[row, max_past - old_length:max_past] = 1
-                attention_mask[row, max_past:max_past + chunk_length] = 1
+                if prefill_backend == "hf":
+                    attention_mask[row, max_past:max_past + chunk_length] = 1
                 position_ids[row, :chunk_length] = torch.arange(
                     old_length, old_length + chunk_length,
                     dtype=torch.long, device=self.device,
                 )
 
-            with torch.inference_mode():
-                output = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    return_dict=True,
-                )
+            try:
+                with torch.inference_mode():
+                    output = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=(prefill_backend == "hf"),
+                        return_dict=True,
+                    )
+            finally:
+                self._paged_context = None
             logits = self._last_valid_logits(output.logits, chunk_lengths)
+            if logits_capture is not None:
+                logits_capture.extend(logits.detach().float().cpu().unbind(dim=0))
             next_tokens = logits.argmax(dim=-1).tolist()
-            full_cache = self._legacy_cache(output.past_key_values)
+            full_cache = (
+                self._legacy_cache(output.past_key_values)
+                if prefill_backend == "hf" else None
+            )
 
             results = []
             for row, (chunk_length, old_length, token, final) in enumerate(
                 zip(chunk_lengths, old_lengths, next_tokens, final_chunks)
             ):
                 table = tables[row]
+                if prefill_backend == "hf":
+                    if table is None:
+                        table = self.kv_cache.allocate(chunk_length)
+                        created_tables.append(table)
+                        tables[row] = table
+                    else:
+                        self.kv_cache.append(table, chunk_length)
+                    for layer_idx, (key, value) in enumerate(full_cache):
+                        key_tokens = key[
+                            row, :, max_past:max_past + chunk_length, :
+                        ].permute(1, 0, 2).contiguous()
+                        value_tokens = value[
+                            row, :, max_past:max_past + chunk_length, :
+                        ].permute(1, 0, 2).contiguous()
+                        self.kv_cache.write_layer(
+                            table, layer_idx, old_length, key_tokens, value_tokens
+                        )
                 if table is None:
-                    table = self.kv_cache.allocate(chunk_length)
-                    created_tables.append(table)
-                else:
-                    self.kv_cache.append(table, chunk_length)
-                for layer_idx, (key, value) in enumerate(full_cache):
-                    key_tokens = key[
-                        row, :, max_past:max_past + chunk_length, :
-                    ].permute(1, 0, 2).contiguous()
-                    value_tokens = value[
-                        row, :, max_past:max_past + chunk_length, :
-                    ].permute(1, 0, 2).contiguous()
-                    self.kv_cache.write_layer(
-                        table, layer_idx, old_length, key_tokens, value_tokens
-                    )
+                    raise RuntimeError("paged prefill did not allocate a KV block table")
                 results.append((int(token) if final else None, _SequenceState(table)))
             return results
         except Exception:
+            self._paged_context = None
             released: set[int] = set()
             for table in match_owned_tables + created_tables:
                 if not table._released and id(table) not in released:
@@ -653,7 +920,8 @@ class HuggingFaceBackend:
             raise
 
     def prefill(self, prompts: Sequence[Sequence[int]], *,
-                prefix_matches: Sequence[PrefixMatch] | None = None) -> list[tuple[int, object]]:
+                prefix_matches: Sequence[PrefixMatch] | None = None,
+                logits_capture: list[Any] | None = None) -> list[tuple[int, object]]:
         if prefix_matches is not None:
             if len(prefix_matches) != len(prompts):
                 raise ValueError("prefix match count must equal prompt batch size")
@@ -677,6 +945,8 @@ class HuggingFaceBackend:
             output = self.model(input_ids=ids, attention_mask=mask, position_ids=positions,
                                 use_cache=True, return_dict=True)
         logits = self._last_valid_logits(output.logits, lengths)
+        if logits_capture is not None:
+            logits_capture.append(logits.detach().float().cpu())
         next_tokens = logits.argmax(dim=-1).tolist()
         full_cache = self._legacy_cache(output.past_key_values)
         results = []

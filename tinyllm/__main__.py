@@ -17,6 +17,8 @@ def main() -> None:
                         help="decode tokens plus prefill tokens allowed per scheduler iteration")
     parser.add_argument("--prefill-chunk-size", type=int, default=128,
                         help="maximum prompt tokens processed per sequence per iteration")
+    parser.add_argument("--prefill-backend", choices=("hf", "triton_paged"), default="hf",
+                        help="use HF/FA4 dense prefill or direct Triton block-table prefill")
     parser.add_argument("--enable-prefix-caching", action="store_true",
                         help="reuse exact full KV blocks from earlier prompts")
     parser.add_argument("--max-prefix-cache-blocks", type=int, default=256)
@@ -45,6 +47,7 @@ def main() -> None:
                                                   max_model_len=args.max_model_len,
                                                   max_num_batched_tokens=args.max_num_batched_tokens,
                                                   prefill_chunk_size=args.prefill_chunk_size,
+                                                  prefill_backend=args.prefill_backend,
                                                   enable_prefix_caching=args.enable_prefix_caching,
                                                   max_prefix_cache_blocks=args.max_prefix_cache_blocks))
     try:
@@ -61,6 +64,7 @@ def main() -> None:
         print("Scheduler:", {
             "max_num_batched_tokens": scheduler_stats["max_num_batched_tokens"],
             "prefill_chunk_size": scheduler_stats["prefill_chunk_size"],
+            "prefill_backend": scheduler_stats["prefill_backend"],
         })
         prefix_stats = engine.scheduler.stats().get("prefix_cache")
         if prefix_stats is not None:

@@ -110,7 +110,8 @@ class Scheduler:
             matches = [req.prefix_match for req in requests]
             try:
                 outputs = self.backend.prefill_chunk(
-                    token_chunks, states, matches, final_chunks
+                    token_chunks, states, matches, final_chunks,
+                    prefill_backend=self.config.prefill_backend,
                 )
                 if len(outputs) != len(requests):
                     raise RuntimeError("backend prefill_chunk returned the wrong batch size")
@@ -248,6 +249,7 @@ class Scheduler:
                 "max_model_len": self.config.max_model_len,
                 "max_num_batched_tokens": self.config.max_num_batched_tokens,
                 "prefill_chunk_size": self.config.prefill_chunk_size,
+                "prefill_backend": self.config.prefill_backend,
             }
             if self.prefix_cache is not None:
                 stats["prefix_cache"] = self.prefix_cache.snapshot()

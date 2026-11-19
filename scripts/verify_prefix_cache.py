@@ -12,7 +12,8 @@ from tinyllm.model_executor.hf_transformers import HuggingFaceBackend
 def run_pair(backend: HuggingFaceBackend, prompts: tuple[str, str], *,
              enable_prefix_caching: bool, max_tokens: int,
              max_model_len: int, max_num_seqs: int,
-             max_cached_blocks: int) -> tuple[object, object, Engine]:
+             max_cached_blocks: int,
+             prefill_backend: str) -> tuple[object, object, Engine]:
     engine = Engine(
         backend,
         config=EngineConfig(
@@ -20,6 +21,7 @@ def run_pair(backend: HuggingFaceBackend, prompts: tuple[str, str], *,
             max_model_len=max_model_len,
             enable_prefix_caching=enable_prefix_caching,
             max_prefix_cache_blocks=max_cached_blocks,
+            prefill_backend=prefill_backend,
         ),
     )
     try:
@@ -48,6 +50,8 @@ def main() -> int:
     parser.add_argument("--attention-backend", default="flash_attention_4",
                         choices=("sdpa", "flash_attention_2", "flash_attention_3",
                                  "flash_attention_4"))
+    parser.add_argument("--prefill-backend", choices=("hf", "triton_paged"),
+                        default="hf")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=2)
@@ -92,6 +96,7 @@ def main() -> int:
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_cached_blocks=args.max_cached_blocks,
+        prefill_backend=args.prefill_backend,
     )
     baseline_engine.shutdown()
 
@@ -103,6 +108,7 @@ def main() -> int:
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_cached_blocks=args.max_cached_blocks,
+        prefill_backend=args.prefill_backend,
     )
     try:
         print(f"Common token prefix: {common_tokens} tokens")

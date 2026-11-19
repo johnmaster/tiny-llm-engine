@@ -5,7 +5,7 @@ from typing import Any
 
 from .block_manager import PagedKVCacheManager
 from .interfaces import BlockId, BlockTable
-from ..attention.triton_paged import paged_decode_attention
+from ..attention.triton_paged import paged_decode_attention, paged_prefill_attention
 
 
 class PagedKVTensorStore:
@@ -120,6 +120,16 @@ class PagedKVTensorStore:
         key_cache, value_cache = self._ensure_layer(layer_idx)
         return paged_decode_attention(query, key_cache, value_cache,
                                       page_table, lengths, scale)
+
+    def paged_prefill_attention(self, layer_idx: int, query: Any, page_table: Any,
+                                old_lengths: Any, query_lengths: Any,
+                                scale: float) -> Any:
+        """Run causal multi-token attention by following physical page IDs."""
+        self._validate_layer(layer_idx)
+        key_cache, value_cache = self._ensure_layer(layer_idx)
+        return paged_prefill_attention(
+            query, key_cache, value_cache, page_table, old_lengths, query_lengths, scale
+        )
 
     def _ensure_layer(self, layer_idx: int) -> tuple[Any, Any]:
         storage = self._storage[layer_idx]

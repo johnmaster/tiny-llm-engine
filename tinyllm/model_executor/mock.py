@@ -21,7 +21,8 @@ class MockBackend:
     def prefill_chunk(self, token_chunks: Sequence[Sequence[int]],
                       states: Sequence[object | None],
                       prefix_matches: Sequence[PrefixMatch | None],
-                      final_chunks: Sequence[bool]) -> list[tuple[int | None, object]]:
+                      final_chunks: Sequence[bool], *,
+                      prefill_backend: str = "hf") -> list[tuple[int | None, object]]:
         return [(ord("O") if final else None,
                  1 if final else (state if state is not None else 0))
                 for state, final in zip(states, final_chunks)]
