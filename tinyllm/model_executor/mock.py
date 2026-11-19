@@ -2,6 +2,8 @@
 from __future__ import annotations
 from typing import Sequence
 
+from ..kv_cache import PrefixMatch
+
 
 class MockBackend:
     eos_token_id = None
@@ -12,8 +14,17 @@ class MockBackend:
     def decode(self, tokens: Sequence[int]) -> str:
         return bytes(tokens).decode("utf-8", errors="replace")
 
-    def prefill(self, prompts: Sequence[Sequence[int]]) -> list[tuple[int, object]]:
+    def prefill(self, prompts: Sequence[Sequence[int]], *,
+                prefix_matches: Sequence[PrefixMatch] | None = None) -> list[tuple[int, object]]:
         return [(ord("O"), 1) for _ in prompts]
+
+    def prefill_chunk(self, token_chunks: Sequence[Sequence[int]],
+                      states: Sequence[object | None],
+                      prefix_matches: Sequence[PrefixMatch | None],
+                      final_chunks: Sequence[bool]) -> list[tuple[int | None, object]]:
+        return [(ord("O") if final else None,
+                 1 if final else (state if state is not None else 0))
+                for state, final in zip(states, final_chunks)]
 
     def decode_step(self, tokens: Sequence[int], states: Sequence[object]) -> list[tuple[int, object, bool]]:
         response = "K, this is the tiny-llm mock backend."

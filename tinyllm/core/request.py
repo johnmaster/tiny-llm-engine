@@ -17,7 +17,11 @@ class Request:
     prompt_tokens: list[int] = field(default_factory=list)
     output_tokens: list[int] = field(default_factory=list)
     prefix_cached_tokens: int = 0
+    prefix_match_checked: bool = False
+    prefill_cursor: int = 0
+    prefill_chunks: int = 0
     released_block_ids: list[int] = field(default_factory=list)
+    prefix_match: Any = field(default=None, repr=False)
     state: Any = None
     status: str = "waiting"
     error: str | None = None

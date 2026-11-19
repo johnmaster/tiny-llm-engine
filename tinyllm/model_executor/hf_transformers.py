@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from types import MethodType
 from typing import Any, Sequence
 
-from ..kv_cache import BlockTable, PagedKVTensorStore, PrefixMatch
+from ..kv_cache import (BlockTable, KVCacheOutOfBlocks, PagedKVTensorStore,
+                        PrefixMatch)
 
 
 @dataclass
@@ -503,6 +504,153 @@ class HuggingFaceBackend:
         result = self.compare_paged_decode_batch([prompt_tokens], **kwargs)
         return {"steps": result["requests"][0]["steps"],
                 "kernel_checks": result["kernel_checks"]}
+
+    def prefill_chunk(
+        self,
+        token_chunks: Sequence[Sequence[int]],
+        states: Sequence[object | None],
+        prefix_matches: Sequence[PrefixMatch | None],
+        final_chunks: Sequence[bool],
+    ) -> list[tuple[int | None, object]]:
+        """Append one prefill chunk per sequence and return logits when complete."""
+        if not token_chunks:
+            return []
+        batch_size = len(token_chunks)
+        if not (len(states) == len(prefix_matches) == len(final_chunks) == batch_size):
+            raise ValueError("prefill chunk metadata must match the batch size")
+        torch = self.torch
+        chunk_lengths = [len(chunk) for chunk in token_chunks]
+        if any(length == 0 for length in chunk_lengths):
+            raise ValueError("prefill chunks must contain at least one token")
+        old_lengths: list[int] = []
+        tables: list[BlockTable | None] = []
+        match_owned_tables: list[BlockTable] = []
+        created_tables: list[BlockTable] = []
+        for state, match in zip(states, prefix_matches):
+            if state is not None and match is not None and match.block_table is not None:
+                raise ValueError("a prefill chunk cannot use both state and prefix match")
+            if state is not None:
+                table = state.block_table
+                old_length = state.token_count
+            elif match is not None and match.block_table is not None:
+                table = match.block_table
+                old_length = match.matched_tokens
+                match_owned_tables.append(table)
+            else:
+                table = None
+                old_length = 0
+            tables.append(table)
+            old_lengths.append(old_length)
+
+        try:
+            # Fail before modifying any request table if the whole chunk batch
+            # cannot reserve its required pages. The scheduler can then evict
+            # cache-only references and retry this prefill from the full prompt.
+            required_blocks = 0
+            for table, old_length, chunk_length in zip(tables, old_lengths, chunk_lengths):
+                new_length = old_length + chunk_length
+                required = (new_length + self.kv_block_size - 1) // self.kv_block_size
+                required_blocks += required - (0 if table is None else len(table.block_ids))
+                if table is not None and old_length % self.kv_block_size:
+                    last_block = table.block_ids[-1]
+                    if self.kv_cache.manager.ref_count(last_block) > 1:
+                        required_blocks += 1
+            if required_blocks > self.kv_cache.manager.free_blocks:
+                raise KVCacheOutOfBlocks(
+                    f"prefill chunk needs {required_blocks} KV blocks, "
+                    f"only {self.kv_cache.manager.free_blocks} are free"
+                )
+
+            max_past = max(old_lengths, default=0)
+            width = max(chunk_lengths)
+            past_key_values = None
+            if max_past:
+                layer_caches = []
+                for layer_idx in range(self.kv_cache.num_layers):
+                    keys, values = [], []
+                    for table, old_length in zip(tables, old_lengths):
+                        if table is None:
+                            shape = (1, self.kv_cache.num_kv_heads, 0,
+                                     self.kv_cache.head_dim)
+                            key = torch.empty(shape, dtype=self.model.dtype,
+                                              device=self.device)
+                            value = torch.empty_like(key)
+                        else:
+                            key, value = self.kv_cache.gather_layer(table, layer_idx)
+                        missing = max_past - old_length
+                        if missing:
+                            key = torch.nn.functional.pad(key, (0, 0, missing, 0))
+                            value = torch.nn.functional.pad(value, (0, 0, missing, 0))
+                        keys.append(key)
+                        values.append(value)
+                    layer_caches.append((torch.cat(keys, dim=0), torch.cat(values, dim=0)))
+                past_key_values = self._cache_from_legacy(layer_caches)
+
+            input_ids = torch.full(
+                (batch_size, width), self.tokenizer.pad_token_id,
+                dtype=torch.long, device=self.device,
+            )
+            attention_mask = torch.zeros(
+                (batch_size, max_past + width), dtype=torch.long, device=self.device
+            )
+            position_ids = torch.zeros((batch_size, width), dtype=torch.long,
+                                       device=self.device)
+            for row, (chunk, chunk_length, old_length) in enumerate(
+                zip(token_chunks, chunk_lengths, old_lengths)
+            ):
+                input_ids[row, :chunk_length] = torch.tensor(
+                    chunk, dtype=torch.long, device=self.device
+                )
+                if old_length:
+                    attention_mask[row, max_past - old_length:max_past] = 1
+                attention_mask[row, max_past:max_past + chunk_length] = 1
+                position_ids[row, :chunk_length] = torch.arange(
+                    old_length, old_length + chunk_length,
+                    dtype=torch.long, device=self.device,
+                )
+
+            with torch.inference_mode():
+                output = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            logits = self._last_valid_logits(output.logits, chunk_lengths)
+            next_tokens = logits.argmax(dim=-1).tolist()
+            full_cache = self._legacy_cache(output.past_key_values)
+
+            results = []
+            for row, (chunk_length, old_length, token, final) in enumerate(
+                zip(chunk_lengths, old_lengths, next_tokens, final_chunks)
+            ):
+                table = tables[row]
+                if table is None:
+                    table = self.kv_cache.allocate(chunk_length)
+                    created_tables.append(table)
+                else:
+                    self.kv_cache.append(table, chunk_length)
+                for layer_idx, (key, value) in enumerate(full_cache):
+                    key_tokens = key[
+                        row, :, max_past:max_past + chunk_length, :
+                    ].permute(1, 0, 2).contiguous()
+                    value_tokens = value[
+                        row, :, max_past:max_past + chunk_length, :
+                    ].permute(1, 0, 2).contiguous()
+                    self.kv_cache.write_layer(
+                        table, layer_idx, old_length, key_tokens, value_tokens
+                    )
+                results.append((int(token) if final else None, _SequenceState(table)))
+            return results
+        except Exception:
+            released: set[int] = set()
+            for table in match_owned_tables + created_tables:
+                if not table._released and id(table) not in released:
+                    self.kv_cache.release(table)
+                    released.add(id(table))
+            raise
 
     def prefill(self, prompts: Sequence[Sequence[int]], *,
                 prefix_matches: Sequence[PrefixMatch] | None = None) -> list[tuple[int, object]]:

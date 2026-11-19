@@ -13,6 +13,10 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=512,
+                        help="decode tokens plus prefill tokens allowed per scheduler iteration")
+    parser.add_argument("--prefill-chunk-size", type=int, default=128,
+                        help="maximum prompt tokens processed per sequence per iteration")
     parser.add_argument("--enable-prefix-caching", action="store_true",
                         help="reuse exact full KV blocks from earlier prompts")
     parser.add_argument("--max-prefix-cache-blocks", type=int, default=256)
@@ -39,6 +43,8 @@ def main() -> None:
         print("Using MockBackend; pass --model <path> on the GPU server for real inference.")
     engine = Engine(backend, config=EngineConfig(max_num_seqs=args.max_num_seqs,
                                                   max_model_len=args.max_model_len,
+                                                  max_num_batched_tokens=args.max_num_batched_tokens,
+                                                  prefill_chunk_size=args.prefill_chunk_size,
                                                   enable_prefix_caching=args.enable_prefix_caching,
                                                   max_prefix_cache_blocks=args.max_prefix_cache_blocks))
     try:
@@ -51,6 +57,11 @@ def main() -> None:
         kv_cache_summary = getattr(backend, "kv_cache_summary", None)
         if kv_cache_summary is not None:
             print(kv_cache_summary())
+        scheduler_stats = engine.scheduler.stats()
+        print("Scheduler:", {
+            "max_num_batched_tokens": scheduler_stats["max_num_batched_tokens"],
+            "prefill_chunk_size": scheduler_stats["prefill_chunk_size"],
+        })
         prefix_stats = engine.scheduler.stats().get("prefix_cache")
         if prefix_stats is not None:
             print(f"Prefix cache: {prefix_stats}")
