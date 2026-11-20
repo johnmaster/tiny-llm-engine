@@ -1,9 +1,9 @@
 """A small Hugging Face causal-LM backend with batched prefill and decode.
 
 This is a correctness-first backend for learning and experimentation. It uses
-greedy sampling, the selected Hugging Face attention backend for prefill, and a
-Triton kernel that reads Qwen3 decode KV directly through the page table. It is
-not optimized like vLLM.
+greedy sampling, Hugging Face attention for the dense path, and registered
+model implementations to connect supported architectures to paged attention.
+It is not optimized like vLLM.
 Install the dependencies listed in ``requirements-gpu.txt`` in a CUDA-enabled
 PyTorch environment before running it on a GPU machine.
 """
@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 from ..kv_cache import (BlockTable, KVCacheOutOfBlocks, PagedKVTensorStore,
                         PrefixMatch)
+from .adapters import resolve_model_adapter
 
 
 @dataclass
@@ -81,6 +82,8 @@ class HuggingFaceBackend:
                 f"loaded dtype is {self.model.dtype}. Set --dtype bfloat16 or --dtype float16."
             )
         self.attention_backend = attention_backend
+        config = getattr(self.model.config, "text_config", None) or self.model.config
+        self.model_adapter = resolve_model_adapter(config)
         if paged_prefill_block_m not in (16, 32) or paged_prefill_block_n not in (64, 128):
             raise ValueError(
                 "paged prefill tiles must use block_m in {16, 32} "
@@ -92,9 +95,14 @@ class HuggingFaceBackend:
         self._attention_output_capture: dict[str, Any] | None = None
         self._attention_layers: list[tuple[str, str]] = []
         self._attention_modules: list[tuple[str, Any]] = []
-        for name, module in self.model.named_modules():
-            if not name.endswith(".self_attn") or not hasattr(module, "config"):
-                continue
+        if self.model_adapter is not None:
+            candidate_modules = self.model_adapter.find_attention_modules(self.model)
+        else:
+            candidate_modules = [
+                (name, module) for name, module in self.model.named_modules()
+                if name.endswith(".self_attn") and hasattr(module, "config")
+            ]
+        for name, module in candidate_modules:
             configured_backend = getattr(module.config, "_attn_implementation", None)
             if configured_backend is None:
                 continue
@@ -112,6 +120,12 @@ class HuggingFaceBackend:
 
             module.register_forward_hook(count_attention_call)
 
+        if self.model_adapter is not None and len(self._attention_modules) != len(candidate_modules):
+            raise RuntimeError(
+                f"The {self.model_adapter.name} adapter found attention layers without "
+                "a configured Transformers attention backend"
+            )
+
         if self._attention_layers:
             mismatched = [(name, backend) for name, backend in self._attention_layers
                           if backend != attention_backend]
@@ -123,7 +137,6 @@ class HuggingFaceBackend:
 
         if max_num_seqs < 1 or max_model_len < 1 or kv_block_size < 1:
             raise ValueError("max_num_seqs, max_model_len, and kv_block_size must be positive")
-        config = getattr(self.model.config, "text_config", None) or self.model.config
         num_layers = len(self._attention_layers) or int(config.num_hidden_layers)
         num_kv_heads = int(getattr(config, "num_key_value_heads", config.num_attention_heads))
         head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
@@ -149,20 +162,20 @@ class HuggingFaceBackend:
             device=self.device,
         )
         self._paged_context: dict[str, Any] | None = None
-        self._paged_decode_enabled = (
-            bool(self._attention_modules)
-            and all(module.__class__.__name__ == "Qwen3Attention"
-                    for _, module in self._attention_modules)
-        )
+        self._paged_decode_enabled = self.model_adapter is not None
         if self._paged_decode_enabled:
             self._paged_attention_calls = [0] * len(self._attention_modules)
             self._paged_prefill_calls = [0] * len(self._attention_modules)
-            self._install_qwen3_paged_attention()
+            self._install_paged_attention()
         else:
             self._paged_attention_calls = []
             self._paged_prefill_calls = []
-        if getattr(config, "model_type", None) == "qwen3" and not self._paged_decode_enabled:
-            raise RuntimeError("This Transformers Qwen3 implementation cannot be patched for paged decode")
+        if (getattr(config, "model_type", None) in ("qwen2", "qwen3")
+                and not self._paged_decode_enabled):
+            raise RuntimeError(
+                f"This Transformers {config.model_type} implementation is not supported "
+                "by the registered model adapter"
+            )
 
     def attention_summary(self) -> str | None:
         """Summarize configured backends and layers actually called so far."""
@@ -178,7 +191,8 @@ class HuggingFaceBackend:
             decode_mode = "HF dense cache"
         prefill_mode = (f"Triton paged prefill {prefill_layers}/{total} layers"
                         if prefill_layers else self.attention_backend)
-        return (f"Attention layers executed: {invoked}/{total}; "
+        adapter_name = self.model_adapter.name if self.model_adapter is not None else "HF"
+        return (f"Model adapter: {adapter_name}; attention layers executed: {invoked}/{total}; "
                 f"prefill backend: {prefill_mode}; decode: {decode_mode}")
 
     def kv_cache_summary(self) -> str:
@@ -191,7 +205,7 @@ class HuggingFaceBackend:
         if isinstance(state, _SequenceState):
             self.kv_cache.release(state.block_table)
 
-    def _install_qwen3_paged_attention(self) -> None:
+    def _install_paged_attention(self) -> None:
         for _, module in self._attention_modules:
             original_forward = module.forward
 
@@ -200,29 +214,23 @@ class HuggingFaceBackend:
                 context = self._paged_context
                 if context is None:
                     return _original(*args, **kwargs)
-                return self._qwen3_paged_attention_forward(attention_module, context,
-                                                           *args, **kwargs)
+                return self._paged_attention_forward(attention_module, context,
+                                                     *args, **kwargs)
 
             module.forward = MethodType(paged_forward, module)
 
-    def _qwen3_paged_attention_forward(self, module: Any, context: dict[str, Any],
-                                       hidden_states: Any, **kwargs: Any) -> tuple[Any, None]:
-        """Qwen3 causal attention over the request's physical KV pages."""
-        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
-
+    def _paged_attention_forward(self, module: Any, context: dict[str, Any],
+                                 hidden_states: Any, **kwargs: Any) -> tuple[Any, None]:
+        """Run adapter-projected Q/K/V over the request's physical KV pages."""
+        if self.model_adapter is None:
+            raise RuntimeError("paged attention was called without a registered model adapter")
         torch = self.torch
         batch_size, query_length, _ = hidden_states.shape
-        position_embeddings = kwargs.get("position_embeddings")
-        if position_embeddings is None:
-            raise RuntimeError("Qwen3 did not provide rotary position embeddings")
-        hidden_shape = (batch_size, query_length, -1, module.head_dim)
-        query = module.q_norm(module.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_shape = (batch_size, query_length, -1, module.head_dim)
-        key = module.k_norm(module.k_proj(hidden_states).view(key_shape)).transpose(1, 2)
-        value = module.v_proj(hidden_states).view(key_shape).transpose(1, 2)
-        query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
+        query, key, value = self.model_adapter.project_qkv(
+            self, module, hidden_states, kwargs
+        )
 
-        layer_idx = int(module.layer_idx)
+        layer_idx = self.model_adapter.layer_index(module)
         if context.get("mode", "decode") == "prefill":
             query_lengths = context["query_lengths"]
             for row, (table, old_length, valid_length) in enumerate(zip(
@@ -236,7 +244,7 @@ class HuggingFaceBackend:
             attention_output = self.kv_cache.paged_prefill_attention(
                 layer_idx, query, context["page_table"],
                 context["old_lengths_tensor"], context["query_lengths_tensor"],
-                float(module.scaling),
+                self.model_adapter.attention_scale(module),
                 block_m=self.paged_prefill_block_m,
                 block_n=self.paged_prefill_block_n,
             )
@@ -256,7 +264,7 @@ class HuggingFaceBackend:
                     scores = torch.einsum(
                         "hqd,hkd->hqk", query_fp32,
                         dense_key[:, :valid_kv_length, :],
-                    ) * float(module.scaling)
+                    ) * self.model_adapter.attention_scale(module)
                     causal_mask = key_positions[None, :] > query_limits[:, None]
                     scores = scores.masked_fill(causal_mask[None, :, :], float("-inf"))
                     probabilities = torch.softmax(scores, dim=-1)
@@ -301,7 +309,7 @@ class HuggingFaceBackend:
                 )
             attention_output = self.kv_cache.paged_attention(
                 layer_idx, query[:, :, 0, :], context["page_table"],
-                context["lengths"], float(module.scaling),
+                context["lengths"], self.model_adapter.attention_scale(module),
             )
             if "kernel_checks" in context:
                 query_heads = query.shape[1]
@@ -312,7 +320,9 @@ class HuggingFaceBackend:
                     dense_value = dense_value[0].repeat_interleave(groups, dim=0).float()
                     query_fp32 = query[row, :, 0, :].float()
                     scores = torch.einsum("hd,hld->hl", query_fp32, dense_key)
-                    probabilities = torch.softmax(scores * float(module.scaling), dim=-1)
+                    probabilities = torch.softmax(
+                        scores * self.model_adapter.attention_scale(module), dim=-1
+                    )
                     reference_output = torch.einsum(
                         "hl,hld->hd", probabilities, dense_value
                     ).to(dtype=attention_output.dtype)
@@ -340,7 +350,8 @@ class HuggingFaceBackend:
             self._paged_attention_calls[layer_idx] += 1
             attention_output = attention_output.unsqueeze(1).contiguous()
         attention_output = attention_output.reshape(batch_size, query_length, -1).contiguous()
-        return module.o_proj(attention_output), None
+        projected = self.model_adapter.project_output(module, attention_output)
+        return self.model_adapter.format_attention_output(module, projected)
 
     def encode(self, prompt: str) -> list[int]:
         return self.tokenizer.encode(prompt, add_special_tokens=True)
@@ -394,7 +405,9 @@ class HuggingFaceBackend:
     ) -> dict[str, Any]:
         """Compare FA4/HF dense prefill with direct Triton paged prefill."""
         if not self._paged_decode_enabled:
-            raise RuntimeError("paged prefill comparison currently supports patched Qwen3 only")
+            raise RuntimeError(
+                "paged prefill comparison requires a registered model adapter for this architecture"
+            )
         prompts = [list(prompt) for prompt in prompt_batches]
         if not prompts or any(not prompt for prompt in prompts):
             raise ValueError("prompt batch and each prompt must be nonempty")
@@ -520,7 +533,9 @@ class HuggingFaceBackend:
                                    kernel_rtol: float = 1e-2) -> dict[str, Any]:
         """Compare mixed-length Triton paged decode against dense SDPA and eager."""
         if not self._paged_decode_enabled:
-            raise RuntimeError("decode comparison currently supports patched Qwen3 only")
+            raise RuntimeError(
+                "paged decode comparison requires a registered model adapter for this architecture"
+            )
         prompts = [list(prompt) for prompt in prompt_batches]
         if not prompts or any(not prompt for prompt in prompts):
             raise ValueError("prompt batch and each prompt must be nonempty")
@@ -750,7 +765,9 @@ class HuggingFaceBackend:
         if prefill_backend not in ("hf", "triton_paged"):
             raise ValueError("prefill_backend must be 'hf' or 'triton_paged'")
         if prefill_backend == "triton_paged" and not self._paged_decode_enabled:
-            raise RuntimeError("Triton paged prefill currently supports patched Qwen3 only")
+            raise RuntimeError(
+                "Triton paged prefill requires a registered model adapter for this architecture"
+            )
         old_lengths: list[int] = []
         tables: list[BlockTable | None] = []
         match_owned_tables: list[BlockTable] = []
@@ -1152,7 +1169,7 @@ class HuggingFaceBackend:
 
     def _decode_step_paged(self, tokens: Sequence[int], states: Sequence[_SequenceState],
                            old_lengths: list[int]) -> list[tuple[int, object, bool]]:
-        """Run Qwen3 decode with direct block-table attention, without dense KV gather."""
+        """Run adapter-backed decode over paged KV without dense KV gathering."""
         torch = self.torch
         for state in states:
             self.kv_cache.append(state.block_table, 1)

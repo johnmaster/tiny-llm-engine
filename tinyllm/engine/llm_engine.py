@@ -1,6 +1,6 @@
 """Public engine API and scheduler worker lifecycle."""
 from __future__ import annotations
-from threading import Event, Thread
+from threading import Event, RLock, Thread, current_thread
 
 from ..core import Request
 from ..config import EngineConfig
@@ -18,17 +18,26 @@ class LLMEngine:
         self.config = config
         self.scheduler = Scheduler(backend, config=config)
         self._stop = Event()
+        self._shutdown_complete = Event()
+        self._lifecycle_lock = RLock()
+        self._closed = False
         self._thread: Thread | None = None
 
     def submit(self, prompt: str, max_tokens: int = 32) -> Request:
-        return self.scheduler.add_request(prompt, max_tokens)
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("cannot submit a request after engine shutdown")
+            return self.scheduler.add_request(prompt, max_tokens)
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = Thread(target=self._loop, daemon=True, name="tinyllm-scheduler")
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("cannot start an engine after shutdown")
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = Thread(target=self._loop, daemon=True, name="tinyllm-scheduler")
+            self._thread.start()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -36,12 +45,38 @@ class LLMEngine:
             self._stop.wait(0.001)
 
     def shutdown(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-        prefix_cache = getattr(self.scheduler, "prefix_cache", None)
-        if prefix_cache is not None and (self._thread is None or not self._thread.is_alive()):
-            prefix_cache.clear()
+        with self._lifecycle_lock:
+            if self._thread is current_thread():
+                raise RuntimeError("shutdown cannot be called from the scheduler worker thread")
+            if self._closed:
+                thread = self._thread
+                first_shutdown = False
+            else:
+                self._closed = True
+                first_shutdown = True
+                thread = self._thread
+                self.scheduler.begin_shutdown()
+                self._stop.set()
+
+        if not first_shutdown:
+            if thread is not None and thread is not current_thread():
+                thread.join()
+            self._shutdown_complete.wait()
+            return
+
+        # Do not release active KV tables while a model call could still be
+        # reading/writing them. Join without a timeout, then drain residual work.
+        if thread is not None and thread is not current_thread():
+            thread.join()
+        try:
+            self.scheduler.finish_shutdown()
+        finally:
+            prefix_cache = getattr(self.scheduler, "prefix_cache", None)
+            try:
+                if prefix_cache is not None:
+                    prefix_cache.clear()
+            finally:
+                self._shutdown_complete.set()
 
     def generate(self, prompt: str, max_tokens: int = 32, timeout: float = 300) -> Request:
         req = self.submit(prompt, max_tokens)
@@ -51,6 +86,8 @@ class LLMEngine:
             raise TimeoutError(f"request {req.request_id} timed out")
         if req.status == "failed":
             raise RuntimeError(req.error)
+        if req.status == "cancelled":
+            raise RuntimeError(req.error or f"request {req.request_id} was cancelled")
         return req
 
 

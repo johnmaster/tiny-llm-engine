@@ -19,6 +19,7 @@ class Scheduler:
         self._waiting: deque[Request] = deque()
         self._running: list[Request] = []
         self._lock = RLock()
+        self._closed = False
         self._prefill_rotation = 0
         manager = getattr(getattr(backend, "kv_cache", None), "manager", None)
         self.prefix_cache = (
@@ -38,17 +39,57 @@ class Scheduler:
             raise ValueError("prompt plus max_tokens exceeds max_model_len")
         req = Request(prompt, max_tokens, prompt_tokens=prompt_tokens)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot submit a request after scheduler shutdown")
             self._waiting.append(req)
         return req
+
+    def begin_shutdown(self) -> None:
+        """Reject new work, cancel queued work, and mark active work for cleanup.
+
+        Active requests are not released here because a backend call may still be
+        using their KV pages. ``finish_shutdown`` must run after the worker exits.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            waiting = list(self._waiting)
+            self._waiting.clear()
+            running = list(self._running)
+            for req in waiting:
+                self._cancel_request(req, "engine shutdown", signal_ready=True)
+            for req in running:
+                if req.status == "running":
+                    req.status = "cancelled"
+                    req.error = req.error or "engine shutdown"
+
+    def finish_shutdown(self) -> None:
+        """Release all request-owned state after scheduler execution has stopped."""
+        with self._lock:
+            pending = list(self._waiting) + list(self._running)
+            self._waiting.clear()
+            self._running.clear()
+            for req in pending:
+                if req.status not in ("finished", "failed", "cancelled"):
+                    req.status = "cancelled"
+                    req.error = req.error or "engine shutdown"
+                self._cancel_request(
+                    req,
+                    req.error or "engine shutdown",
+                    signal_ready=True,
+                    preserve_terminal=True,
+                )
 
     def step(self) -> None:
         """Decode active sequences, then advance a token-budgeted prefill batch."""
         with self._lock:
+            if self._closed and not self._running:
+                return
             cancelled = [r for r in self._running if r.status == "cancelled"]
             for req in cancelled:
-                self._release_request_state(req)
-                req.ready.set()
-            while self._waiting and len(self._running) < self.max_num_seqs:
+                self._cancel_request(req, req.error, signal_ready=True, preserve_terminal=True)
+            while not self._closed and self._waiting and len(self._running) < self.max_num_seqs:
                 req = self._waiting.popleft()
                 req.status = "running"
                 self._running.append(req)
@@ -147,6 +188,11 @@ class Scheduler:
                 self._fail_requests(requests, exc)
 
         with self._lock:
+            for req in self._running:
+                if req.status == "cancelled" and not req.ready.is_set():
+                    self._cancel_request(
+                        req, req.error, signal_ready=True, preserve_terminal=True
+                    )
             self._running = [r for r in self._running if r.status == "running"]
 
     def _select_prefill_chunks(
@@ -180,34 +226,68 @@ class Scheduler:
         )
 
     def _finish(self, req: Request) -> None:
-        self._release_request_state(req)
         req.status = "finished"
-        req.ready.set()
+        try:
+            self._release_request_state(req)
+        except Exception as exc:
+            req.error = f"KV cache cleanup failed: {exc}"
+        finally:
+            req.ready.set()
 
     def _release_prefix_match(self, req: Request) -> None:
         match = req.prefix_match
+        req.prefix_match = None
         table = getattr(match, "block_table", None)
         if table is not None and not table._released:
             cache = getattr(getattr(self.backend, "kv_cache", None), "manager", None)
             if cache is not None:
                 cache.release(table)
-        req.prefix_match = None
 
     def _release_request_state(self, req: Request) -> None:
         state_table = getattr(req.state, "block_table", None)
         match_table = getattr(req.prefix_match, "block_table", None)
+        errors: list[Exception] = []
         if match_table is not None and match_table is not state_table:
-            self._release_prefix_match(req)
+            try:
+                self._release_prefix_match(req)
+            except Exception as exc:
+                errors.append(exc)
         else:
             req.prefix_match = None
-        if req.state is None:
-            return
-        if state_table is not None:
-            req.released_block_ids = list(state_table.block_ids)
-        release_state = getattr(self.backend, "release_state", None)
-        if release_state is not None:
-            release_state(req.state)
+        state = req.state
         req.state = None
+        if state is not None:
+            if state_table is not None:
+                req.released_block_ids = list(state_table.block_ids)
+            release_state = getattr(self.backend, "release_state", None)
+            if release_state is not None:
+                try:
+                    release_state(state)
+                except Exception as exc:
+                    errors.append(exc)
+                    manager = getattr(getattr(self.backend, "kv_cache", None), "manager", None)
+                    if state_table is not None and not state_table._released and manager is not None:
+                        try:
+                            manager.release(state_table)
+                        except Exception as fallback_exc:
+                            errors.append(fallback_exc)
+        if errors:
+            raise RuntimeError("; ".join(str(error) for error in errors))
+
+    def _cancel_request(self, req: Request, reason: str | None, *,
+                        signal_ready: bool, preserve_terminal: bool = False) -> None:
+        if not preserve_terminal and req.status not in ("finished", "failed"):
+            req.status = "cancelled"
+        if reason and req.status == "cancelled":
+            req.error = req.error or reason
+        try:
+            self._release_request_state(req)
+        except Exception as exc:
+            cleanup_error = f"KV cache cleanup failed: {exc}"
+            req.error = f"{req.error}; {cleanup_error}" if req.error else cleanup_error
+        finally:
+            if signal_ready:
+                req.ready.set()
 
     def _fail_requests(self, requests: list[Request], error: Exception) -> None:
         with self._lock:
@@ -225,7 +305,7 @@ class Scheduler:
                 req.ready.set()
 
     def cancel(self, req: Request) -> None:
-        """Cancel a request; running model work is cleaned up by the next step."""
+        """Cancel a request, releasing state when no backend call is using it."""
         with self._lock:
             if req.status in ("finished", "failed", "cancelled"):
                 return
@@ -234,11 +314,9 @@ class Scheduler:
                     self._waiting.remove(req)
                 except ValueError:
                     pass
-                req.status = "cancelled"
-                req.ready.set()
+                self._cancel_request(req, "request cancelled", signal_ready=True)
                 return
             req.status = "cancelled"
-            req.ready.set()
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
