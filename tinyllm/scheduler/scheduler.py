@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 
 from ..config import EngineConfig
@@ -19,6 +19,10 @@ class Scheduler:
         self._waiting: deque[Request] = deque()
         self._running: list[Request] = []
         self._lock = RLock()
+        # Serialize the full scheduler step, including calls into the backend.
+        # _lock only protects scheduler state and is deliberately released
+        # around model execution.
+        self._step_lock = Lock()
         self._closed = False
         self._prefill_rotation = 0
         manager = getattr(getattr(backend, "kv_cache", None), "manager", None)
@@ -66,23 +70,31 @@ class Scheduler:
 
     def finish_shutdown(self) -> None:
         """Release all request-owned state after scheduler execution has stopped."""
-        with self._lock:
-            pending = list(self._waiting) + list(self._running)
-            self._waiting.clear()
-            self._running.clear()
-            for req in pending:
-                if req.status not in ("finished", "failed", "cancelled"):
-                    req.status = "cancelled"
-                    req.error = req.error or "engine shutdown"
-                self._cancel_request(
-                    req,
-                    req.error or "engine shutdown",
-                    signal_ready=True,
-                    preserve_terminal=True,
-                )
+        # Engine shutdown joins its worker first; this also waits for any
+        # externally-invoked scheduler.step() before releasing active KV pages.
+        with self._step_lock:
+            with self._lock:
+                pending = list(self._waiting) + list(self._running)
+                self._waiting.clear()
+                self._running.clear()
+                for req in pending:
+                    if req.status not in ("finished", "failed", "cancelled"):
+                        req.status = "cancelled"
+                        req.error = req.error or "engine shutdown"
+                    self._cancel_request(
+                        req,
+                        req.error or "engine shutdown",
+                        signal_ready=True,
+                        preserve_terminal=True,
+                    )
 
     def step(self) -> None:
         """Decode active sequences, then advance a token-budgeted prefill batch."""
+        with self._step_lock:
+            self._step_once()
+
+    def _step_once(self) -> None:
+        """Run one serialized scheduler iteration."""
         with self._lock:
             if self._closed and not self._running:
                 return
@@ -317,6 +329,12 @@ class Scheduler:
                 self._cancel_request(req, "request cancelled", signal_ready=True)
                 return
             req.status = "cancelled"
+
+    def clear_prefix_cache(self) -> None:
+        """Clear cache-owned KV references between scheduler iterations."""
+        with self._step_lock:
+            if self.prefix_cache is not None:
+                self.prefix_cache.clear()
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

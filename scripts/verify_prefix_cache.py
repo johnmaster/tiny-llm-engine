@@ -117,7 +117,7 @@ def main() -> int:
         print("Uncached/cached greedy outputs:",
               baseline_first.output_tokens == cached_first.output_tokens,
               baseline_second.output_tokens == cached_second.output_tokens)
-        print("Prefix cache stats:", cached_engine.scheduler.stats()["prefix_cache"])
+        print("Prefix cache stats:", cached_engine.stats()["prefix_cache"])
 
         if cached_second.prefix_cached_tokens < expected_hit_tokens:
             raise RuntimeError("the second prompt did not hit the expected full KV blocks")
@@ -126,9 +126,7 @@ def main() -> int:
         if baseline_second.output_tokens != cached_second.output_tokens:
             raise RuntimeError("cached second-prompt output differs from uncached output")
 
-        prefix_cache = cached_engine.scheduler.prefix_cache
-        if prefix_cache is not None:
-            prefix_cache.clear()
+        cached_engine.clear_prefix_cache()
         stats = backend.kv_cache.manager.snapshot()
         print("KV blocks after clearing the prefix cache:", stats)
         if stats["used_blocks"] != 0:

@@ -197,13 +197,19 @@ class HuggingFaceBackend:
 
     def kv_cache_summary(self) -> str:
         stats = self.kv_cache.manager.snapshot()
-        return (f"Paged KV storage: block_size={self.kv_block_size}; "
+        return (f"Paged KV storage: backend={self.kv_cache.storage_backend}; "
+                f"block_size={self.kv_block_size}; "
                 f"active_blocks={self.kv_cache.materialized_blocks}/"
-                f"{stats['total_blocks']}")
+                f"{stats['total_blocks']}; committed_blocks="
+                f"{self.kv_cache.committed_blocks}/{stats['total_blocks']}")
 
     def release_state(self, state: object) -> None:
         if isinstance(state, _SequenceState):
             self.kv_cache.release(state.block_table)
+
+    def release_kv_cache_storage(self) -> None:
+        """Return KV backing memory when an owning Engine shuts down."""
+        self.kv_cache.close()
 
     def _install_paged_attention(self) -> None:
         for _, module in self._attention_modules:
@@ -247,6 +253,11 @@ class HuggingFaceBackend:
                 self.model_adapter.attention_scale(module),
                 block_m=self.paged_prefill_block_m,
                 block_n=self.paged_prefill_block_n,
+                required_blocks=max(
+                    (max(table.block_ids, default=-1) + 1
+                     for table in context["tables"]),
+                    default=0,
+                ),
             )
             if "kernel_checks" in context:
                 query_heads = query.shape[1]
@@ -310,6 +321,11 @@ class HuggingFaceBackend:
             attention_output = self.kv_cache.paged_attention(
                 layer_idx, query[:, :, 0, :], context["page_table"],
                 context["lengths"], self.model_adapter.attention_scale(module),
+                required_blocks=max(
+                    (max(table.block_ids, default=-1) + 1
+                     for table in context["tables"]),
+                    default=0,
+                ),
             )
             if "kernel_checks" in context:
                 query_heads = query.shape[1]

@@ -16,7 +16,7 @@ class LLMEngine:
         if config is None:
             config = EngineConfig(max_num_seqs=8 if max_num_seqs is None else max_num_seqs)
         self.config = config
-        self.scheduler = Scheduler(backend, config=config)
+        self._scheduler = Scheduler(backend, config=config)
         self._stop = Event()
         self._shutdown_complete = Event()
         self._lifecycle_lock = RLock()
@@ -27,7 +27,11 @@ class LLMEngine:
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("cannot submit a request after engine shutdown")
-            return self.scheduler.add_request(prompt, max_tokens)
+            req = self._scheduler.add_request(prompt, max_tokens)
+            # Start the sole scheduler worker on first use. Concurrent callers
+            # can submit and wait without coordinating a separate step loop.
+            self.start()
+            return req
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -41,8 +45,24 @@ class LLMEngine:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self.scheduler.step()
+            self._scheduler.step()
             self._stop.wait(0.001)
+
+    def wait(self, req: Request, timeout: float | None = None) -> bool:
+        """Wait until a submitted request reaches a terminal state."""
+        return req.ready.wait(timeout)
+
+    def cancel(self, req: Request) -> None:
+        """Cancel a request submitted to this engine."""
+        self._scheduler.cancel(req)
+
+    def stats(self) -> dict[str, object]:
+        """Return a snapshot of scheduler and cache counters."""
+        return self._scheduler.stats()
+
+    def clear_prefix_cache(self) -> None:
+        """Clear cached KV prefixes after the current scheduler step finishes."""
+        self._scheduler.clear_prefix_cache()
 
     def shutdown(self) -> None:
         with self._lifecycle_lock:
@@ -55,7 +75,7 @@ class LLMEngine:
                 self._closed = True
                 first_shutdown = True
                 thread = self._thread
-                self.scheduler.begin_shutdown()
+                self._scheduler.begin_shutdown()
                 self._stop.set()
 
         if not first_shutdown:
@@ -69,20 +89,24 @@ class LLMEngine:
         if thread is not None and thread is not current_thread():
             thread.join()
         try:
-            self.scheduler.finish_shutdown()
+            self._scheduler.finish_shutdown()
         finally:
-            prefix_cache = getattr(self.scheduler, "prefix_cache", None)
             try:
-                if prefix_cache is not None:
-                    prefix_cache.clear()
+                self._scheduler.clear_prefix_cache()
             finally:
-                self._shutdown_complete.set()
+                try:
+                    release_cache = getattr(
+                        self.backend, "release_kv_cache_storage", None
+                    )
+                    if release_cache is not None:
+                        release_cache()
+                finally:
+                    self._shutdown_complete.set()
 
     def generate(self, prompt: str, max_tokens: int = 32, timeout: float = 300) -> Request:
         req = self.submit(prompt, max_tokens)
-        self.start()
-        if not req.ready.wait(timeout):
-            self.scheduler.cancel(req)
+        if not self.wait(req, timeout):
+            self.cancel(req)
             raise TimeoutError(f"request {req.request_id} timed out")
         if req.status == "failed":
             raise RuntimeError(req.error)
