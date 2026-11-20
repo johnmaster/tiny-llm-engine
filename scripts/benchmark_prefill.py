@@ -136,20 +136,22 @@ def run_trial(backend: HuggingFaceBackend, prompts: list[str], *, prefill_backen
 
 
 def benchmark_chunk_size(backend: HuggingFaceBackend, prompts: list[str], *,
-                        chunk_size: int, trials: int, max_tokens: int,
-                        max_model_len: int, token_budget: int,
-                        timeout: float) -> bool:
-    results: dict[str, list[dict[str, object]]] = {"hf": [], "triton_paged": []}
+                        chunk_size: int, kernel_tiles: list[tuple[int, int]],
+                        trials: int, max_tokens: int, max_model_len: int,
+                        token_budget: int, timeout: float) -> bool:
+    dense_results: list[dict[str, object]] = []
+    paged_results = {tile: [] for tile in kernel_tiles}
     for trial_index in range(trials):
-        order = (["hf", "triton_paged"] if trial_index % 2 == 0
-                 else ["triton_paged", "hf"])
-        for prefill_backend in order:
-            label = "Dense HF/FA4" if prefill_backend == "hf" else "Triton paged"
+        def run(prefill_backend: str, tile: tuple[int, int] | None = None
+                ) -> dict[str, object]:
+            if tile is not None:
+                backend.paged_prefill_block_m, backend.paged_prefill_block_n = tile
+            label = "Dense HF/FA4" if tile is None else f"Triton paged tile={tile[0]}x{tile[1]}"
             print(
                 f"Chunk size {chunk_size}; trial {trial_index + 1}/{trials}: "
                 f"{label} warmup + measurement"
             )
-            results[prefill_backend].append(run_trial(
+            return run_trial(
                 backend,
                 prompts,
                 prefill_backend=prefill_backend,
@@ -158,42 +160,67 @@ def benchmark_chunk_size(backend: HuggingFaceBackend, prompts: list[str], *,
                 token_budget=token_budget,
                 chunk_size=chunk_size,
                 timeout=timeout,
-            ))
+            )
 
-    trial_matches = []
-    for trial_index, (dense, paged) in enumerate(zip(
-        results["hf"], results["triton_paged"]
-    ), start=1):
-        matches = dense["outputs"] == paged["outputs"]
-        trial_matches.append(matches)
-        print(f"\nChunk size {chunk_size}, trial {trial_index} output tokens match: {matches}")
-        if not matches:
-            for request, (dense_tokens, paged_tokens) in enumerate(zip(
-                dense["outputs"], paged["outputs"]
-            )):
-                first_mismatch = next((index for index, (dense_token, paged_token) in
-                                       enumerate(zip(dense_tokens, paged_tokens))
-                                       if dense_token != paged_token), None)
-                if first_mismatch is not None:
-                    print(
-                        f"  request={request} token_index={first_mismatch} "
-                        f"dense={dense_tokens[first_mismatch]} "
-                        f"paged={paged_tokens[first_mismatch]}"
-                    )
-                elif len(dense_tokens) != len(paged_tokens):
-                    print(
-                        f"  request={request} output lengths differ: "
-                        f"dense={len(dense_tokens)} paged={len(paged_tokens)}"
-                    )
+        if trial_index % 2 == 0:
+            dense_results.append(run("hf"))
+        for tile in kernel_tiles:
+            paged_results[tile].append(run("triton_paged", tile))
+        if trial_index % 2 == 1:
+            dense_results.append(run("hf"))
 
-    print_summary(f"hf, chunk_size={chunk_size}", results["hf"])
-    print_summary(f"triton_paged, chunk_size={chunk_size}", results["triton_paged"])
-    matches_all_trials = all(trial_matches)
-    print(
-        f"Chunk size {chunk_size}: greedy output tokens match in every trial: "
-        f"{matches_all_trials}"
-    )
-    return matches_all_trials
+    print_summary(f"hf, chunk_size={chunk_size}", dense_results)
+    all_matches = True
+    for tile in kernel_tiles:
+        tile_results = paged_results[tile]
+        print(f"\nKernel tile {tile[0]}x{tile[1]} output checks:")
+        trial_matches = []
+        for trial_index, (dense, paged) in enumerate(zip(dense_results, tile_results), start=1):
+            matches = dense["outputs"] == paged["outputs"]
+            trial_matches.append(matches)
+            print(f"  trial {trial_index}/{trials}: greedy output tokens match: {matches}")
+            if not matches:
+                for request, (dense_tokens, paged_tokens) in enumerate(zip(
+                    dense["outputs"], paged["outputs"]
+                )):
+                    first_mismatch = next((index for index, (dense_token, paged_token) in
+                                           enumerate(zip(dense_tokens, paged_tokens))
+                                           if dense_token != paged_token), None)
+                    if first_mismatch is not None:
+                        print(
+                            f"    request={request} token_index={first_mismatch} "
+                            f"dense={dense_tokens[first_mismatch]} "
+                            f"paged={paged_tokens[first_mismatch]}"
+                        )
+                    elif len(dense_tokens) != len(paged_tokens):
+                        print(
+                            f"    request={request} output lengths differ: "
+                            f"dense={len(dense_tokens)} paged={len(paged_tokens)}"
+                        )
+        print_summary(
+            f"triton_paged, chunk_size={chunk_size}, tile={tile[0]}x{tile[1]}",
+            tile_results,
+        )
+        matches_all_trials = all(trial_matches)
+        all_matches &= matches_all_trials
+        print(
+            f"Chunk size {chunk_size}, tile {tile[0]}x{tile[1]}: "
+            f"greedy output tokens match in every trial: {matches_all_trials}"
+        )
+    return all_matches
+
+
+def parse_kernel_tile(value: str) -> tuple[int, int]:
+    try:
+        block_m_text, block_n_text = value.lower().split("x", maxsplit=1)
+        tile = int(block_m_text), int(block_n_text)
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("kernel tile must look like 16x64") from exc
+    if tile[0] not in (16, 32) or tile[1] not in (64, 128):
+        raise argparse.ArgumentTypeError(
+            "supported kernel tiles are 16x64, 16x128, 32x64, and 32x128"
+        )
+    return tile
 
 
 def main() -> int:
@@ -216,6 +243,12 @@ def main() -> int:
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--chunk-sizes", type=int, nargs="+", default=None,
                         help="sweep these chunk sizes instead of --chunk-size")
+    parser.add_argument(
+        "--kernel-tiles", type=parse_kernel_tile, nargs="+", default=[(16, 64)],
+        metavar="MxN",
+        help="sweep Triton kernel tiles separately from scheduler chunk sizes "
+             "(e.g. 16x64 16x128 32x64 32x128)",
+    )
     parser.add_argument("--token-budget", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--prompt", default=(
@@ -232,6 +265,7 @@ def main() -> int:
     if not chunk_sizes or any(chunk_size < 1 for chunk_size in chunk_sizes):
         parser.error("chunk sizes must all be at least 1")
     chunk_sizes = list(dict.fromkeys(chunk_sizes))
+    kernel_tiles = list(dict.fromkeys(args.kernel_tiles))
 
     backend = HuggingFaceBackend(
         args.model,
@@ -249,11 +283,13 @@ def main() -> int:
 
     outputs_match = True
     for chunk_size in chunk_sizes:
-        print(f"\n=== Benchmarking chunk_size={chunk_size} ===")
+        print(f"\n=== Benchmarking scheduler chunk_size={chunk_size}; "
+              f"kernel tiles={kernel_tiles} ===")
         outputs_match &= benchmark_chunk_size(
             backend,
             prompts,
             chunk_size=chunk_size,
+            kernel_tiles=kernel_tiles,
             trials=args.trials,
             max_tokens=args.max_tokens,
             max_model_len=args.max_model_len,

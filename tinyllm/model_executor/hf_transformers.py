@@ -29,7 +29,9 @@ class _SequenceState:
 class HuggingFaceBackend:
     def __init__(self, model_name_or_path: str, *, dtype: str = "auto", device: str = "cuda",
                  attention_backend: str = "sdpa", max_num_seqs: int = 8,
-                 max_model_len: int = 8192, kv_block_size: int = 16):
+                 max_model_len: int = 8192, kv_block_size: int = 16,
+                 paged_prefill_block_m: int = 16,
+                 paged_prefill_block_n: int = 64):
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -79,6 +81,13 @@ class HuggingFaceBackend:
                 f"loaded dtype is {self.model.dtype}. Set --dtype bfloat16 or --dtype float16."
             )
         self.attention_backend = attention_backend
+        if paged_prefill_block_m not in (16, 32) or paged_prefill_block_n not in (64, 128):
+            raise ValueError(
+                "paged prefill tiles must use block_m in {16, 32} "
+                "and block_n in {64, 128}"
+            )
+        self.paged_prefill_block_m = paged_prefill_block_m
+        self.paged_prefill_block_n = paged_prefill_block_n
         self._attention_calls: dict[str, int] = {}
         self._attention_output_capture: dict[str, Any] | None = None
         self._attention_layers: list[tuple[str, str]] = []
@@ -228,6 +237,8 @@ class HuggingFaceBackend:
                 layer_idx, query, context["page_table"],
                 context["old_lengths_tensor"], context["query_lengths_tensor"],
                 float(module.scaling),
+                block_m=self.paged_prefill_block_m,
+                block_n=self.paged_prefill_block_n,
             )
             if "kernel_checks" in context:
                 query_heads = query.shape[1]

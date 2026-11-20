@@ -5,7 +5,11 @@ from typing import Any
 
 from .block_manager import PagedKVCacheManager
 from .interfaces import BlockId, BlockTable
-from ..attention.triton_paged import paged_decode_attention, paged_prefill_attention
+from ..attention.triton_paged import (
+    paged_decode_attention,
+    paged_prefill_attention,
+    paged_prefill_attention_reference,
+)
 
 
 class PagedKVTensorStore:
@@ -123,11 +127,24 @@ class PagedKVTensorStore:
 
     def paged_prefill_attention(self, layer_idx: int, query: Any, page_table: Any,
                                 old_lengths: Any, query_lengths: Any,
-                                scale: float) -> Any:
-        """Run causal multi-token attention by following physical page IDs."""
+                                scale: float, *, block_m: int = 16,
+                                block_n: int = 64) -> Any:
+        """Run tiled causal attention by following physical page IDs."""
         self._validate_layer(layer_idx)
         key_cache, value_cache = self._ensure_layer(layer_idx)
         return paged_prefill_attention(
+            query, key_cache, value_cache, page_table, old_lengths, query_lengths,
+            scale, block_m=block_m, block_n=block_n,
+        )
+
+    def paged_prefill_attention_reference(
+        self, layer_idx: int, query: Any, page_table: Any,
+        old_lengths: Any, query_lengths: Any, scale: float,
+    ) -> Any:
+        """Run the original one-query-per-program reference prefill kernel."""
+        self._validate_layer(layer_idx)
+        key_cache, value_cache = self._ensure_layer(layer_idx)
+        return paged_prefill_attention_reference(
             query, key_cache, value_cache, page_table, old_lengths, query_lengths, scale
         )
 

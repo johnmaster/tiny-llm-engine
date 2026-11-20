@@ -36,6 +36,8 @@ def main() -> int:
                         default=[15, 16, 17, 31, 32, 33, 63, 64, 65])
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--chunk-size", type=int, default=32)
+    parser.add_argument("--kernel-block-m", type=int, choices=(16, 32), default=16)
+    parser.add_argument("--kernel-block-n", type=int, choices=(64, 128), default=64)
     parser.add_argument("--kernel-atol", type=float, default=1e-2)
     parser.add_argument("--kernel-rtol", type=float, default=1e-2)
     args = parser.parse_args()
@@ -56,6 +58,8 @@ def main() -> int:
         max_num_seqs=max(args.batch_sizes),
         max_model_len=args.max_model_len,
         kv_block_size=args.block_size,
+        paged_prefill_block_m=args.kernel_block_m,
+        paged_prefill_block_n=args.kernel_block_n,
     )
     seed = backend.encode(args.prompt)
     if not seed:
@@ -70,6 +74,7 @@ def main() -> int:
     print("Reference: Hugging Face dense prefill with configured attention backend")
     print("Candidate: Triton causal prefill reading the device block table")
     print(f"Block size: {args.block_size}; chunk size: {args.chunk_size}; "
+          f"kernel tile: {args.kernel_block_m}x{args.kernel_block_n}; "
           f"dtype: {backend.model.dtype}")
 
     for batch_size in args.batch_sizes:
