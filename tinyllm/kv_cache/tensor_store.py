@@ -1,15 +1,18 @@
 """Per-layer contiguous storage for GPU block-table KV attention."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from .cuda_vmm import CudaVirtualBuffer, probe_cuda_vmm
 from .block_manager import PagedKVCacheManager
 from .interfaces import BlockId, BlockTable
 from ..attention.triton_paged import (
     paged_decode_attention,
     paged_prefill_attention,
-    paged_prefill_attention_reference,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class PagedKVTensorStore:
@@ -30,9 +33,26 @@ class PagedKVTensorStore:
         self.head_dim = head_dim
         self.dtype = dtype
         self.device = device
+        self._use_cuda_vmm = False
+        if self.torch.device(device).type == "cuda":
+            self._use_cuda_vmm, reason = probe_cuda_vmm(self.torch, device, dtype)
+            if self._use_cuda_vmm:
+                logger.info("KV storage backend: CUDA VMM (startup probe passed)")
+            else:
+                logger.warning(
+                    "CUDA VMM probe failed (%s); falling back to ordinary torch.empty "
+                    "KV storage",
+                    reason,
+                )
+        else:
+            logger.info("KV storage backend: ordinary torch.empty")
         # One contiguous page pool per layer is required by the GPU paged
-        # attention kernel. The pools are allocated lazily on first write.
+        # attention kernel. CUDA VMM reserves stable virtual ranges and commits
+        # physical memory only as block IDs are first touched.
         self._storage: list[tuple[Any, Any] | None] = [None] * num_layers
+        self._vmm_storage: list[tuple[CudaVirtualBuffer, CudaVirtualBuffer] | None] = [
+            None
+        ] * num_layers
         self.manager = PagedKVCacheManager(
             num_blocks, block_size, copy_block=self._copy_block
         )
@@ -46,10 +66,47 @@ class PagedKVTensorStore:
     def release(self, table: BlockTable) -> None:
         self.manager.release(table)
 
+    def close(self) -> None:
+        """Release physical cache storage while keeping the manager reusable."""
+        if self.manager.used_blocks:
+            raise RuntimeError(
+                "cannot close KV storage while block tables are still allocated"
+            )
+        if self.torch.device(self.device).type == "cuda":
+            self.torch.cuda.synchronize(self.device)
+
+        buffers = [
+            buffer
+            for pair in self._vmm_storage if pair is not None
+            for buffer in pair
+        ]
+        for buffer in buffers:
+            buffer.close(synchronize=False)
+        self._storage = [None] * self.num_layers
+        self._vmm_storage = [None] * self.num_layers
+
     @property
     def materialized_blocks(self) -> int:
         """Number of physical pages currently held by active sequences."""
         return self.manager.used_blocks
+
+    @property
+    def committed_blocks(self) -> int:
+        """Largest number of blocks backed by physical CUDA memory."""
+        if not self._use_cuda_vmm:
+            if all(storage is not None for storage in self._storage):
+                return self.manager.num_blocks
+            return 0
+        vmm_blocks = max(
+            (buffer.committed_blocks
+             for pair in self._vmm_storage if pair is not None for buffer in pair),
+            default=0,
+        )
+        return vmm_blocks
+
+    @property
+    def storage_backend(self) -> str:
+        return "cuda_vmm" if self._use_cuda_vmm else "torch"
 
     def device_page_table(self, tables: list[BlockTable]) -> tuple[Any, Any]:
         """Pack request block tables and lengths into device tensors once per batch."""
@@ -86,7 +143,7 @@ class PagedKVTensorStore:
             logical_block, offset = divmod(token_pos, self.block_size)
             block_id = self.manager.ensure_writable(table, logical_block)
             count = min(key.shape[0] - cursor, self.block_size - offset)
-            key_cache, value_cache = self._ensure_layer(layer_idx)
+            key_cache, value_cache = self._ensure_layer(layer_idx, block_id + 1)
             key_block, value_block = key_cache[block_id], value_cache[block_id]
             key_block[offset:offset + count].copy_(key[cursor:cursor + count])
             value_block[offset:offset + count].copy_(value[cursor:cursor + count])
@@ -106,7 +163,7 @@ class PagedKVTensorStore:
             count = min(remaining, self.block_size)
             if count <= 0:
                 break
-            key_cache, value_cache = self._ensure_layer(layer_idx)
+            key_cache, value_cache = self._ensure_layer(layer_idx, block_id + 1)
             key_block, value_block = key_cache[block_id], value_cache[block_id]
             key_parts.append(key_block[:count])
             value_parts.append(value_block[:count])
@@ -118,51 +175,64 @@ class PagedKVTensorStore:
         return key, value
 
     def paged_attention(self, layer_idx: int, query: Any, page_table: Any,
-                        lengths: Any, scale: float) -> Any:
+                        lengths: Any, scale: float, *,
+                        required_blocks: int = 0) -> Any:
         """Run fused Triton attention directly over physical pages and block tables."""
         self._validate_layer(layer_idx)
-        key_cache, value_cache = self._ensure_layer(layer_idx)
+        key_cache, value_cache = self._ensure_layer(layer_idx, required_blocks)
         return paged_decode_attention(query, key_cache, value_cache,
                                       page_table, lengths, scale)
 
     def paged_prefill_attention(self, layer_idx: int, query: Any, page_table: Any,
                                 old_lengths: Any, query_lengths: Any,
                                 scale: float, *, block_m: int = 16,
-                                block_n: int = 64) -> Any:
+                                block_n: int = 64,
+                                required_blocks: int = 0) -> Any:
         """Run tiled causal attention by following physical page IDs."""
         self._validate_layer(layer_idx)
-        key_cache, value_cache = self._ensure_layer(layer_idx)
+        key_cache, value_cache = self._ensure_layer(layer_idx, required_blocks)
         return paged_prefill_attention(
             query, key_cache, value_cache, page_table, old_lengths, query_lengths,
             scale, block_m=block_m, block_n=block_n,
         )
 
-    def paged_prefill_attention_reference(
-        self, layer_idx: int, query: Any, page_table: Any,
-        old_lengths: Any, query_lengths: Any, scale: float,
-    ) -> Any:
-        """Run the original one-query-per-program reference prefill kernel."""
-        self._validate_layer(layer_idx)
-        key_cache, value_cache = self._ensure_layer(layer_idx)
-        return paged_prefill_attention_reference(
-            query, key_cache, value_cache, page_table, old_lengths, query_lengths, scale
-        )
-
-    def _ensure_layer(self, layer_idx: int) -> tuple[Any, Any]:
+    def _ensure_layer(self, layer_idx: int, required_blocks: int = 0) -> tuple[Any, Any]:
         storage = self._storage[layer_idx]
         if storage is None:
-            shape = (self.manager.num_blocks, self.block_size,
-                     self.num_kv_heads, self.head_dim)
-            storage = (
-                self.torch.empty(shape, dtype=self.dtype, device=self.device),
-                self.torch.empty(shape, dtype=self.dtype, device=self.device),
-            )
+            shape = (self.manager.num_blocks, self.block_size, self.num_kv_heads,
+                     self.head_dim)
+            if self._use_cuda_vmm:
+                key_buffer = CudaVirtualBuffer(
+                    torch=self.torch, shape=shape, dtype=self.dtype, device=self.device
+                )
+                try:
+                    value_buffer = CudaVirtualBuffer(
+                        torch=self.torch, shape=shape, dtype=self.dtype,
+                        device=self.device,
+                    )
+                    storage = (key_buffer.as_torch_tensor(), value_buffer.as_torch_tensor())
+                except Exception:
+                    key_buffer.close()
+                    raise
+                self._vmm_storage[layer_idx] = (key_buffer, value_buffer)
+            else:
+                storage = (
+                    self.torch.empty(shape, dtype=self.dtype, device=self.device),
+                    self.torch.empty(shape, dtype=self.dtype, device=self.device),
+                )
             self._storage[layer_idx] = storage
+        if required_blocks:
+            vmm_pair = self._vmm_storage[layer_idx]
+            if vmm_pair is not None:
+                for buffer in vmm_pair:
+                    buffer.commit_blocks(required_blocks)
         return storage
 
     def _copy_block(self, source: BlockId, destination: BlockId, valid_tokens: int) -> None:
         for layer_idx in range(self.num_layers):
-            key_cache, value_cache = self._ensure_layer(layer_idx)
+            key_cache, value_cache = self._ensure_layer(
+                layer_idx, max(source, destination) + 1
+            )
             source_key, source_value = key_cache[source], value_cache[source]
             destination_key = key_cache[destination]
             destination_value = value_cache[destination]

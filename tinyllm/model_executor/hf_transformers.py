@@ -126,14 +126,13 @@ class HuggingFaceBackend:
                 "a configured Transformers attention backend"
             )
 
-        if self._attention_layers:
-            mismatched = [(name, backend) for name, backend in self._attention_layers
-                          if backend != attention_backend]
-            if mismatched:
-                details = ", ".join(f"{name}={backend}" for name, backend in mismatched)
-                raise RuntimeError(
-                    f"Some attention layers did not select {attention_backend}: {details}"
-                )
+        mismatched = [(name, backend) for name, backend in self._attention_layers
+                      if backend != attention_backend]
+        if mismatched:
+            details = ", ".join(f"{name}={backend}" for name, backend in mismatched)
+            raise RuntimeError(
+                f"Some attention layers did not select {attention_backend}: {details}"
+            )
 
         if max_num_seqs < 1 or max_model_len < 1 or kv_block_size < 1:
             raise ValueError("max_num_seqs, max_model_len, and kv_block_size must be positive")
@@ -145,9 +144,7 @@ class HuggingFaceBackend:
             free_bytes, _ = torch.cuda.mem_get_info(self.device)
             bytes_per_block = (num_layers * 2 * num_kv_heads * head_dim * kv_block_size
                                * torch.empty((), dtype=self.model.dtype).element_size())
-            # Leave room for temporary dense batches, logits, and CUDA workspaces.
-            # The paged kernel uses fixed contiguous per-layer pools, so retain
-            # extra headroom for prefill workspaces and logits.
+            # Reserve GPU memory for dense batches, logits, and CUDA workspaces.
             memory_limited_blocks = max(1, int(free_bytes * 0.45) // bytes_per_block)
             max_blocks = min(max_blocks, memory_limited_blocks)
         self.kv_block_size = kv_block_size
@@ -178,7 +175,10 @@ class HuggingFaceBackend:
             )
 
     def attention_summary(self) -> str | None:
-        """Summarize configured backends and layers actually called so far."""
+        """Runtime diagnostic: summarize configured and actually called attention layers.
+
+        Used by the CLI and verification scripts; the scheduler does not depend on it.
+        """
         if not self._attention_layers:
             return None
         total = len(self._attention_layers)
@@ -196,14 +196,21 @@ class HuggingFaceBackend:
                 f"prefill backend: {prefill_mode}; decode: {decode_mode}")
 
     def kv_cache_summary(self) -> str:
+        """Runtime diagnostic: summarize KV storage allocation and commitment."""
         stats = self.kv_cache.manager.snapshot()
-        return (f"Paged KV storage: block_size={self.kv_block_size}; "
+        return (f"Paged KV storage: backend={self.kv_cache.storage_backend}; "
+                f"block_size={self.kv_block_size}; "
                 f"active_blocks={self.kv_cache.materialized_blocks}/"
-                f"{stats['total_blocks']}")
+                f"{stats['total_blocks']}; committed_blocks="
+                f"{self.kv_cache.committed_blocks}/{stats['total_blocks']}")
 
     def release_state(self, state: object) -> None:
         if isinstance(state, _SequenceState):
             self.kv_cache.release(state.block_table)
+
+    def release_kv_cache_storage(self) -> None:
+        """Return KV backing memory when an owning Engine shuts down."""
+        self.kv_cache.close()
 
     def _install_paged_attention(self) -> None:
         for _, module in self._attention_modules:
@@ -247,6 +254,11 @@ class HuggingFaceBackend:
                 self.model_adapter.attention_scale(module),
                 block_m=self.paged_prefill_block_m,
                 block_n=self.paged_prefill_block_n,
+                required_blocks=max(
+                    (max(table.block_ids, default=-1) + 1
+                     for table in context["tables"]),
+                    default=0,
+                ),
             )
             if "kernel_checks" in context:
                 query_heads = query.shape[1]
@@ -310,6 +322,11 @@ class HuggingFaceBackend:
             attention_output = self.kv_cache.paged_attention(
                 layer_idx, query[:, :, 0, :], context["page_table"],
                 context["lengths"], self.model_adapter.attention_scale(module),
+                required_blocks=max(
+                    (max(table.block_ids, default=-1) + 1
+                     for table in context["tables"]),
+                    default=0,
+                ),
             )
             if "kernel_checks" in context:
                 query_heads = query.shape[1]
@@ -363,10 +380,8 @@ class HuggingFaceBackend:
         if hasattr(cache, "to_legacy_cache"):
             cache = cache.to_legacy_cache()
         elif hasattr(cache, "layers"):
-            # Transformers 5 Cache objects expose per-layer key/value tensors
-            # through ``layers`` and may no longer implement the legacy tuple
-            # conversion helper.
-            cache = tuple((layer.keys, layer.values) for layer in cache.layers)
+            # Newer Transformers caches expose per-layer tensors directly.
+            return tuple((layer.keys, layer.values) for layer in cache.layers)
         return tuple((key, value) for key, value in cache)
 
     @staticmethod
@@ -391,8 +406,6 @@ class HuggingFaceBackend:
 
     @staticmethod
     def _last_valid_logits(logits: Any, lengths: list[int]) -> Any:
-        # Prefill input rows are right-padded, so each row's last prompt token is
-        # at length - 1 (not at the final padded column).
         return logits[range(len(lengths)), [length - 1 for length in lengths], :]
 
     def compare_paged_prefill(
@@ -403,7 +416,11 @@ class HuggingFaceBackend:
         kernel_atol: float = 1e-2,
         kernel_rtol: float = 1e-2,
     ) -> dict[str, Any]:
-        """Compare FA4/HF dense prefill with direct Triton paged prefill."""
+        """Verification-only: compare dense prefill with direct Triton paged prefill.
+
+        This runs reference and candidate paths and captures intermediate tensors. It is
+        called by kernel comparison scripts, not by normal Engine/Scheduler inference.
+        """
         if not self._paged_decode_enabled:
             raise RuntimeError(
                 "paged prefill comparison requires a registered model adapter for this architecture"
@@ -531,7 +548,11 @@ class HuggingFaceBackend:
                                    *, steps: int = 4, atol: float = 5e-2,
                                    rtol: float = 5e-2, kernel_atol: float = 1e-2,
                                    kernel_rtol: float = 1e-2) -> dict[str, Any]:
-        """Compare mixed-length Triton paged decode against dense SDPA and eager."""
+        """Verification-only: compare paged decode against dense SDPA and eager.
+
+        This runs multiple reference paths and records numerical diagnostics. It is
+        called by kernel comparison scripts, not by normal Engine/Scheduler inference.
+        """
         if not self._paged_decode_enabled:
             raise RuntimeError(
                 "paged decode comparison requires a registered model adapter for this architecture"
@@ -733,7 +754,10 @@ class HuggingFaceBackend:
                     self.kv_cache.release(table)
 
     def compare_paged_decode(self, prompt_tokens: Sequence[int], **kwargs: Any) -> dict[str, Any]:
-        """Single-request convenience wrapper for ``compare_paged_decode_batch``."""
+        """Verification-only single-request wrapper for ``compare_paged_decode_batch``.
+
+        Not used by normal Engine/Scheduler inference.
+        """
         result = self.compare_paged_decode_batch([prompt_tokens], **kwargs)
         return {"steps": result["requests"][0]["steps"],
                 "kernel_checks": result["kernel_checks"]}
@@ -752,7 +776,13 @@ class HuggingFaceBackend:
         chunk_index: int = 0,
         logits_capture: list[Any] | None = None,
     ) -> list[tuple[int | None, object]]:
-        """Append one prefill chunk per sequence and return logits when complete."""
+        """Append one prefill chunk per sequence and return logits when complete.
+
+        This is part of the normal scheduler inference path. The optional
+        ``kernel_checks``, tolerance, ``chunk_index``, and ``logits_capture`` arguments
+        are verification hooks used by the paged-prefill comparison script; normal
+        Engine/Scheduler calls leave them at their defaults.
+        """
         if not token_chunks:
             return []
         batch_size = len(token_chunks)
@@ -1001,11 +1031,6 @@ class HuggingFaceBackend:
     ) -> list[tuple[int, object]]:
         """Prefill only suffix tokens, attending to cached prefix KV pages."""
         torch = self.torch
-        if not suffixes:
-            for match in prefix_matches:
-                if match.block_table is not None and not match.block_table._released:
-                    self.kv_cache.release(match.block_table)
-            return []
         suffix_lengths = [len(suffix) for suffix in suffixes]
         prefix_lengths = [match.matched_tokens for match in prefix_matches]
         prefix_tables = [match.block_table for match in prefix_matches]
@@ -1014,8 +1039,6 @@ class HuggingFaceBackend:
         created_tables: list[BlockTable] = []
 
         try:
-            if len(prefix_matches) != batch_size:
-                raise ValueError("prefix match count must equal prompt batch size")
             if any(length == 0 for length in suffix_lengths):
                 raise ValueError("prefix cache must leave at least one token for prefill")
             if any((table is None) != (length == 0)
@@ -1024,7 +1047,7 @@ class HuggingFaceBackend:
             if any(table is not None and table.token_count != length
                    for table, length in zip(prefix_tables, prefix_lengths)):
                 raise ValueError("prefix match table length does not match its token count")
-            max_prefix = max(prefix_lengths, default=0)
+            max_prefix = max(prefix_lengths)
             width = max(suffix_lengths)
             past_key_values = None
             if max_prefix:

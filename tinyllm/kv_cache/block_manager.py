@@ -38,14 +38,18 @@ class PagedKVCacheManager:
         self.block_size = block_size
         self._copy_block = copy_block
         self._owner = object()
+        # Keep never-used pages separate so recently released pages are reused
+        # first. This lets the extensible KV backing track peak live demand
+        # instead of growing through the entire pool across short requests.
         self._free: deque[BlockId] = deque(range(num_blocks))
+        self._recycled: list[BlockId] = []
         self._ref_counts = [0] * num_blocks
         self._lock = RLock()
 
     @property
     def free_blocks(self) -> int:
         with self._lock:
-            return len(self._free)
+            return len(self._free) + len(self._recycled)
 
     @property
     def used_blocks(self) -> int:
@@ -133,7 +137,7 @@ class PagedKVCacheManager:
                 raise ValueError(f"block {block_id} is not allocated")
             self._ref_counts[block_id] -= 1
             if self._ref_counts[block_id] == 0:
-                self._free.append(block_id)
+                self._recycled.append(block_id)
 
     def ensure_writable(self, table: BlockTable, logical_block: int,
                         copy_block: CopyBlock | None = None) -> BlockId:
@@ -155,7 +159,7 @@ class PagedKVCacheManager:
             for block_id in table.block_ids:
                 self._ref_counts[block_id] -= 1
                 if self._ref_counts[block_id] == 0:
-                    self._free.append(block_id)
+                    self._recycled.append(block_id)
             table._released = True
 
     def block_for_token(self, table: BlockTable, token_index: int) -> tuple[BlockId, int]:
@@ -172,8 +176,8 @@ class PagedKVCacheManager:
         with self._lock:
             return {
                 "total_blocks": self.num_blocks,
-                "free_blocks": len(self._free),
-                "used_blocks": self.num_blocks - len(self._free),
+                "free_blocks": len(self._free) + len(self._recycled),
+                "used_blocks": self.num_blocks - len(self._free) - len(self._recycled),
                 "block_size": self.block_size,
             }
 
@@ -192,19 +196,22 @@ class PagedKVCacheManager:
             copier(source, destination, valid_tokens)
         except Exception:
             self._ref_counts[destination] = 0
-            self._free.appendleft(destination)
+            self._recycled.append(destination)
             raise
         table.block_ids[logical_block] = destination
         self._ref_counts[source] -= 1
         return destination
 
     def _take_blocks(self, count: int) -> list[BlockId]:
-        if count > len(self._free):
+        free_count = len(self._free) + len(self._recycled)
+        if count > free_count:
             raise KVCacheOutOfBlocks(
                 f"KV block pool exhausted: requested {count} blocks, "
-                f"only {len(self._free)} free ({self.num_blocks} total)"
+                f"only {free_count} free ({self.num_blocks} total)"
             )
-        ids = [self._free.popleft() for _ in range(count)]
+        ids = []
+        for _ in range(count):
+            ids.append(self._recycled.pop() if self._recycled else self._free.popleft())
         for block_id in ids:
             self._ref_counts[block_id] = 1
         return ids
@@ -234,4 +241,4 @@ class PagedKVCacheManager:
     def _return_unpublished(self, block_ids: list[BlockId]) -> None:
         for block_id in block_ids:
             self._ref_counts[block_id] = 0
-            self._free.appendleft(block_id)
+            self._recycled.append(block_id)

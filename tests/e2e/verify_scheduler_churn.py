@@ -133,14 +133,11 @@ def main() -> int:
         if after_wave1["used_blocks"] != 0:
             raise RuntimeError("KV blocks were not fully released after request completion")
 
-        # The block manager uses a FIFO free list. Hold all never-used pages so
-        # the next scheduler wave must allocate from the pages just released.
+        # Released pages should be reused before untouched pool pages, keeping
+        # the extensible cache's backing near the live-demand high-water mark.
         total_blocks = after_wave1["total_blocks"]
         if len(all_wave_pages) > total_blocks:
             raise RuntimeError("observed more unique request pages than the cache contains")
-        held_pages = backend.kv_cache.manager.allocate(
-            (total_blocks - len(all_wave_pages)) * backend.kv_block_size
-        )
 
         reused_requests = [engine.submit(prompt, args.reuse_max_tokens)
                            for prompt in args.prompts]
@@ -155,17 +152,18 @@ def main() -> int:
         if not reused_page_ids:
             raise RuntimeError("the new wave did not reuse any page IDs from completed requests")
         wait_requests(reused_requests, args.timeout)
-        backend.kv_cache.manager.release(held_pages)
 
         final_stats = backend.kv_cache.manager.snapshot()
         print("KV blocks after reuse wave completed:", final_stats)
         if final_stats["used_blocks"] != 0:
             raise RuntimeError("KV blocks remained allocated after the reuse wave")
+        print("KV storage after reuse wave:", backend.kv_cache_summary())
         print("Attention summary:", backend.attention_summary())
         print("Scheduler churn and KV reuse: PASS")
         result_ok = True
     finally:
         engine.shutdown()
+        print("KV storage after Engine shutdown:", backend.kv_cache_summary())
     return 0 if result_ok else 1
 
 

@@ -60,13 +60,13 @@ def main() -> None:
         kv_cache_summary = getattr(backend, "kv_cache_summary", None)
         if kv_cache_summary is not None:
             print(kv_cache_summary())
-        scheduler_stats = engine.scheduler.stats()
+        scheduler_stats = engine.stats()
         print("Scheduler:", {
             "max_num_batched_tokens": scheduler_stats["max_num_batched_tokens"],
             "prefill_chunk_size": scheduler_stats["prefill_chunk_size"],
             "prefill_backend": scheduler_stats["prefill_backend"],
         })
-        prefix_stats = engine.scheduler.stats().get("prefix_cache")
+        prefix_stats = engine.stats().get("prefix_cache")
         if prefix_stats is not None:
             print(f"Prefix cache: {prefix_stats}")
         print(engine.backend.decode(req.output_tokens))
